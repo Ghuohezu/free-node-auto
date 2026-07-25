@@ -49,11 +49,16 @@ jobs:
 
 
 
-    - name: Install
+- name: Commit
+  uses: stefanzweifel/git-auto-commit-action@v5
+  with:
 
-      run: |
+    commit_message: "自动更新节点"
 
-        pip install requests pyyaml
+    file_pattern: |
+      output/nodes.txt
+
+    push_options: --force
 
 
 
