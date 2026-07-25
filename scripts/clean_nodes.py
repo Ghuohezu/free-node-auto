@@ -1,279 +1,162 @@
 import os
 import re
-import base64
-
-
-INPUT = "output/raw_nodes.txt"
-
-OUTPUT = "output/nodes.txt"
 
 
 
-# 支持的节点协议
+INPUT="output/raw_nodes.txt"
 
-PROTOCOLS = [
+OUTPUT="output/nodes.txt"
+
+
+
+# 支持所有协议
+
+PROTOCOLS=[
     "vmess://",
     "vless://",
     "ss://",
+    "ssr://",
     "trojan://",
     "hysteria://",
+    "hysteria2://",
     "hy2://",
     "tuic://"
 ]
 
 
 
-def read_file():
-
-    if not os.path.exists(INPUT):
-
-        print("没有找到:", INPUT)
-
-        return ""
-
-
-    with open(
-        INPUT,
-        "r",
-        encoding="utf-8",
-        errors="ignore"
-    ) as f:
-
-        return f.read()
-
-
-
-def decode_base64(text):
+def extract_nodes(text):
 
     result=[]
 
 
-    try:
-
-        clean=text.replace("\n","").replace("\r","")
+    for line in text.splitlines():
 
 
-        data=base64.b64decode(
-            clean+"==="
-        ).decode(
-            "utf-8",
-            errors="ignore"
-        )
+        line=line.strip()
 
 
-        if "://" in data:
+        if not line:
 
-            result.append(data)
+            continue
 
 
-    except:
 
-        pass
+        for p in PROTOCOLS:
+
+
+            if p in line:
+
+
+                index=line.find(p)
+
+
+                node=line[index:]
+
+
+                result.append(node)
+
+
+                break
+
 
 
     return result
 
 
 
+def get_unique_key(node):
 
-def extract_nodes(text):
-
-    nodes=[]
-
-
-    # 原始URI
-
-    for line in text.splitlines():
-
-        line=line.strip()
-
-
-        for p in PROTOCOLS:
-
-            if line.startswith(p):
-
-                nodes.append(line)
-
-
-
-    # Base64订阅
-
-    nodes.extend(
-        decode_base64(text)
-    )
-
-
-    return nodes
-
-
-
-
-def node_key(node):
 
     """
-    节点唯一识别
+    去重核心
 
     优先:
-    UUID
+    uuid
 
     其次:
-    server:port
+    server+port
 
     """
 
-    # UUID
 
-    uuid=re.findall(
-        r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}",
+    uuid=re.search(
+        r'([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})',
         node
     )
 
 
     if uuid:
 
-        return "uuid:"+uuid[0].lower()
+
+        return "uuid:"+uuid.group(1).lower()
 
 
 
-    # server port
-
-    server=re.search(
-        r"@([^:/?#]+):(\d+)",
+    host=re.search(
+        r'@([^:/?#]+)',
         node
     )
 
 
-    if server:
-
-        return (
-            "server:"
-            +
-            server.group(1)
-            +
-            ":"
-            +
-            server.group(2)
-        )
-
-
-
-    # 普通SS格式
-
-    server=re.search(
-        r"([^:/]+):(\d+)",
+    port=re.search(
+        r':(\d{2,6})',
         node
     )
 
 
-    if server:
+    if host and port:
+
 
         return (
             "server:"
-            +
-            server.group(1)
-            +
-            ":"
-            +
-            server.group(2)
+            +host.group(1)
+            +":"
+            +port.group(1)
         )
 
 
-
-    return node[:80]
-
-
-
-
-def clean_nodes(nodes):
-
-    result=[]
-
-    seen=set()
-
-
-
-    for node in nodes:
-
-
-        key=node_key(node)
-
-
-        if key in seen:
-
-            continue
-
-
-
-        seen.add(key)
-
-
-        result.append(node)
-
-
-
-    return result
-
-
-
-
-def save(nodes):
-
-
-    os.makedirs(
-        "output",
-        exist_ok=True
-    )
-
-
-    # 强制清空旧文件
-
-    if os.path.exists(OUTPUT):
-
-        open(
-            OUTPUT,
-            "w",
-            encoding="utf-8"
-        ).close()
-
-
-
-    # 全新写入
-
-    with open(
-        OUTPUT,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-
-        for n in nodes:
-
-            f.write(
-                n.strip()
-                +
-                "\n"
-            )
-
+    return node
 
 
 
 def main():
 
 
-    print("读取节点...")
-
-
-    raw=read_file()
-
-
     print(
-        "原始长度:",
-        len(raw)
+        "读取节点..."
     )
 
 
 
-    nodes=extract_nodes(raw)
+    if not os.path.exists(INPUT):
+
+        print(
+            "没有raw文件"
+        )
+
+        return
+
+
+
+    with open(
+        INPUT,
+        encoding="utf-8"
+    ) as f:
+
+        text=f.read()
+
+
+
+    print(
+        "原始长度:",
+        len(text)
+    )
+
+
+
+    nodes=extract_nodes(text)
+
 
 
     print(
@@ -283,26 +166,68 @@ def main():
 
 
 
-    clean=clean_nodes(nodes)
+    unique={}
+
+
+
+    for node in nodes:
+
+
+        key=get_unique_key(node)
+
+
+        if key not in unique:
+
+
+            unique[key]=node
+
+
+
+    final=list(
+        unique.values()
+    )
+
 
 
     print(
         "去重后:",
-        len(clean)
+        len(final)
     )
 
 
 
-    save(clean)
+    os.makedirs(
+        "output",
+        exist_ok=True
+    )
+
+
+    with open(
+        OUTPUT,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+
+        for node in final:
+
+
+            f.write(
+                node+"\n"
+            )
+
 
 
     print(
         "输出完成:",
-        OUTPUT,
-        "数量:",
-        len(clean)
+        OUTPUT
     )
 
+
+    print(
+        "最终文件数量:",
+        len(final)
+    )
 
 
 
