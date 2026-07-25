@@ -6,70 +6,117 @@ INPUT = "output/raw_nodes.txt"
 OUTPUT = "output/nodes.txt"
 
 
-def get_key(node):
+def node_key(node):
 
     node=node.strip()
 
-    # VLESS UUID
+
+    # VLESS
     if node.startswith("vless://"):
+
         m=re.search(
             r'vless://([^@]+)@([^:]+):(\d+)',
             node
         )
+
         if m:
+
             uuid,server,port=m.groups()
-            return f"vless|{server}|{port}|{uuid}"
 
+            return (
+                "vless|"
+                +server+
+                "|"+
+                port+
+                "|"+
+                uuid
+            )
 
-    # VMESS
-    if node.startswith("vmess://"):
-        return node[:120]
-
-
-    # SS
-    if node.startswith("ss://"):
-        m=re.search(
-            r'@([^:]+):(\d+)',
-            node
-        )
-        if m:
-            server,port=m.groups()
-            return f"ss|{server}|{port}"
 
 
     # Trojan
+
     if node.startswith("trojan://"):
+
+        m=re.search(
+            r'trojan://([^@]+)@([^:]+):(\d+)',
+            node
+        )
+
+        if m:
+
+            password,server,port=m.groups()
+
+            return (
+                "trojan|"
+                +server+
+                "|"+
+                port+
+                "|"+
+                password
+            )
+
+
+
+    # SS
+
+    if node.startswith("ss://"):
+
         m=re.search(
             r'@([^:]+):(\d+)',
             node
         )
+
         if m:
+
             server,port=m.groups()
-            return f"trojan|{server}|{port}"
+
+            return (
+                "ss|"
+                +server+
+                "|"+
+                port
+            )
 
 
-    return node[:100]
+
+    # VMESS
+
+    if node.startswith("vmess://"):
+
+        return node[:150]
 
 
 
-def main():
+    # HY
 
-    print("读取节点...")
+    if node.startswith(
+        (
+        "hysteria://",
+        "hy2://"
+        )
+    ):
+
+        return node.split("#")[0]
 
 
-    with open(INPUT,"r",encoding="utf8") as f:
-        data=f.read()
 
+    return None
+
+
+
+
+def extract_nodes(text):
 
     nodes=[]
 
 
-    for line in data.splitlines():
+    for line in text.splitlines():
 
         line=line.strip()
 
-        if (
-            line.startswith(
+
+        if line.startswith(
             (
             "vless://",
             "vmess://",
@@ -77,13 +124,58 @@ def main():
             "trojan://",
             "hysteria://",
             "hy2://"
-            ))
+            )
         ):
+
             nodes.append(line)
 
 
+    return nodes
 
-    print("发现节点:",len(nodes))
+
+
+
+def main():
+
+
+    print("读取节点...")
+
+
+    if not os.path.exists(INPUT):
+
+        print(
+            "不存在:",
+            INPUT
+        )
+
+        return
+
+
+
+    with open(
+        INPUT,
+        encoding="utf-8"
+    ) as f:
+
+        raw=f.read()
+
+
+
+    print(
+        "原始长度:",
+        len(raw)
+    )
+
+
+
+    nodes=extract_nodes(raw)
+
+
+    print(
+        "发现节点:",
+        len(nodes)
+    )
+
 
 
     result=[]
@@ -91,18 +183,41 @@ def main():
     seen=set()
 
 
-    for n in nodes:
 
-        key=get_key(n)
+    for node in nodes:
+
+
+        key=node_key(node)
+
+
+        if key is None:
+
+            continue
+
+
 
         if key not in seen:
 
             seen.add(key)
-            result.append(n)
+
+            result.append(node)
 
 
 
-    print("去重后:",len(result))
+
+    print(
+        "去重后:",
+        len(result)
+    )
+
+
+
+    # 删除旧文件
+
+    if os.path.exists(OUTPUT):
+
+        os.remove(OUTPUT)
+
 
 
     os.makedirs(
@@ -111,21 +226,28 @@ def main():
     )
 
 
+
     with open(
         OUTPUT,
         "w",
-        encoding="utf8"
+        encoding="utf-8"
     ) as f:
 
-        for n in result:
-            f.write(n+"\n")
+
+        for node in result:
+
+            f.write(
+                node+"\n"
+            )
+
 
 
     print(
-        "输出完成",
+        "输出完成:",
         OUTPUT
     )
 
 
 if __name__=="__main__":
+
     main()
