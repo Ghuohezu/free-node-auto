@@ -3,27 +3,33 @@ import os
 import base64
 
 
-SOURCES="config/sources.txt"
+SOURCES = "config/sources.txt"
 
-OUTPUT="output/raw_nodes.txt"
+OUTPUT = "output/raw_nodes.txt"
 
 
-headers={
-    "User-Agent":"Mozilla/5.0"
+headers = {
+    "User-Agent": "Mozilla/5.0"
 }
 
 
 
-def decode_base64(text):
+def try_decode_base64(text):
 
     result=[]
 
     try:
 
-        raw=text.replace("\n","").replace("\r","")
+        clean=text.replace(
+            "\n",
+            ""
+        ).replace(
+            "\r",
+            ""
+        )
 
         data=base64.b64decode(
-            raw+"==="
+            clean + "==="
         ).decode(
             "utf-8",
             errors="ignore"
@@ -33,7 +39,6 @@ def decode_base64(text):
         if "://" in data:
 
             result.append(data)
-
 
     except:
 
@@ -47,15 +52,23 @@ def decode_base64(text):
 def main():
 
 
+    os.makedirs(
+        "output",
+        exist_ok=True
+    )
+
+
     if not os.path.exists(SOURCES):
 
         print(
-            "没有找到:",
-            SOURCES
+            "没有sources.txt"
         )
 
         return
 
+
+
+    urls=[]
 
 
     with open(
@@ -63,11 +76,13 @@ def main():
         encoding="utf-8"
     ) as f:
 
-        urls=[
-            x.strip()
-            for x in f
-            if x.strip()
-        ]
+        for line in f:
+
+            line=line.strip()
+
+            if line:
+
+                urls.append(line)
 
 
 
@@ -77,7 +92,8 @@ def main():
     )
 
 
-    result=[]
+
+    nodes=[]
 
 
 
@@ -85,6 +101,7 @@ def main():
 
 
         try:
+
 
             print(
                 "抓取:",
@@ -107,36 +124,29 @@ def main():
             )
 
 
+
             text=r.text
 
 
-            # 原始
 
-            result.append(text)
-
+            nodes.append(text)
 
 
-            # base64
 
-            result.extend(
-                decode_base64(text)
+            nodes.extend(
+                try_decode_base64(text)
             )
 
 
 
         except Exception as e:
 
+
             print(
                 "失败:",
                 e
             )
 
-
-
-    os.makedirs(
-        "output",
-        exist_ok=True
-    )
 
 
     with open(
@@ -146,17 +156,19 @@ def main():
     ) as f:
 
 
-        for item in result:
+        for n in nodes:
 
             f.write(
-                item+"\n"
+                n+"\n"
             )
+
 
 
     print(
         "生成:",
         OUTPUT
     )
+
 
 
 if __name__=="__main__":
