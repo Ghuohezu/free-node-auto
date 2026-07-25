@@ -49,11 +49,23 @@ jobs:
 
 
 
-    - name: Install dependencies
+    - name: Install
 
       run: |
 
-        pip install requests
+        pip install requests pyyaml
+
+
+
+    - name: Download Sources
+
+      run: |
+
+        mkdir -p output
+
+        touch output/raw_nodes.txt
+
+        python scripts/fetch_nodes.py
 
 
 
@@ -65,22 +77,14 @@ jobs:
 
 
 
-    - name: Commit and push
+    - name: Commit
 
-      run: |
+      uses: stefanzweifel/git-auto-commit-action@v5
 
-        git config --global user.name "github-actions[bot]"
+      with:
 
-        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        commit_message: "自动更新节点"
 
+        file_pattern: output/nodes.txt
 
-        git pull --rebase origin main
-
-
-        git add output/nodes.txt
-
-
-        git commit -m "自动更新节点" || exit 0
-
-
-        git push origin main
+        push_options: --force
