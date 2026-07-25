@@ -1,1 +1,3 @@
-
+https://jikun8.zmxoo.xyz/linkapi?v=20260723&placeholder=1&placeholder=2&placeholder=3
+https://raw.githubusercontent.com/zhuhaiuk/free-nodes/main/nodes.txt
+https://raw.githubusercontent.com/Alex0510/onskr/refs/heads/main/output/nodes.txt
