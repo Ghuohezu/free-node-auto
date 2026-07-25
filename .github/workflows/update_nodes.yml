@@ -1,8 +1,7 @@
-
 name: Update Free Nodes
 
 
-on:
+"on":
 
   schedule:
 
@@ -20,7 +19,6 @@ permissions:
 
 
 jobs:
-
 
   update:
 
