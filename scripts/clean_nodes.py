@@ -1,107 +1,77 @@
 import os
 import re
+import base64
 
 
 INPUT = "output/raw_nodes.txt"
+
 OUTPUT = "output/nodes.txt"
 
 
-def node_key(node):
 
-    node=node.strip()
+# 支持的节点协议
+
+PROTOCOLS = [
+    "vmess://",
+    "vless://",
+    "ss://",
+    "trojan://",
+    "hysteria://",
+    "hy2://",
+    "tuic://"
+]
 
 
-    # VLESS
-    if node.startswith("vless://"):
 
-        m=re.search(
-            r'vless://([^@]+)@([^:]+):(\d+)',
-            node
+def read_file():
+
+    if not os.path.exists(INPUT):
+
+        print("没有找到:", INPUT)
+
+        return ""
+
+
+    with open(
+        INPUT,
+        "r",
+        encoding="utf-8",
+        errors="ignore"
+    ) as f:
+
+        return f.read()
+
+
+
+def decode_base64(text):
+
+    result=[]
+
+
+    try:
+
+        clean=text.replace("\n","").replace("\r","")
+
+
+        data=base64.b64decode(
+            clean+"==="
+        ).decode(
+            "utf-8",
+            errors="ignore"
         )
 
-        if m:
 
-            uuid,server,port=m.groups()
+        if "://" in data:
 
-            return (
-                "vless|"
-                +server+
-                "|"+
-                port+
-                "|"+
-                uuid
-            )
+            result.append(data)
 
 
+    except:
 
-    # Trojan
-
-    if node.startswith("trojan://"):
-
-        m=re.search(
-            r'trojan://([^@]+)@([^:]+):(\d+)',
-            node
-        )
-
-        if m:
-
-            password,server,port=m.groups()
-
-            return (
-                "trojan|"
-                +server+
-                "|"+
-                port+
-                "|"+
-                password
-            )
+        pass
 
 
-
-    # SS
-
-    if node.startswith("ss://"):
-
-        m=re.search(
-            r'@([^:]+):(\d+)',
-            node
-        )
-
-        if m:
-
-            server,port=m.groups()
-
-            return (
-                "ss|"
-                +server+
-                "|"+
-                port
-            )
-
-
-
-    # VMESS
-
-    if node.startswith("vmess://"):
-
-        return node[:150]
-
-
-
-    # HY
-
-    if node.startswith(
-        (
-        "hysteria://",
-        "hy2://"
-        )
-    ):
-
-        return node.split("#")[0]
-
-
-
-    return None
+    return result
 
 
 
@@ -111,26 +81,178 @@ def extract_nodes(text):
     nodes=[]
 
 
+    # 原始URI
+
     for line in text.splitlines():
 
         line=line.strip()
 
 
-        if line.startswith(
-            (
-            "vless://",
-            "vmess://",
-            "ss://",
-            "trojan://",
-            "hysteria://",
-            "hy2://"
-            )
-        ):
+        for p in PROTOCOLS:
 
-            nodes.append(line)
+            if line.startswith(p):
+
+                nodes.append(line)
+
+
+
+    # Base64订阅
+
+    nodes.extend(
+        decode_base64(text)
+    )
 
 
     return nodes
+
+
+
+
+def node_key(node):
+
+    """
+    节点唯一识别
+
+    优先:
+    UUID
+
+    其次:
+    server:port
+
+    """
+
+    # UUID
+
+    uuid=re.findall(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}",
+        node
+    )
+
+
+    if uuid:
+
+        return "uuid:"+uuid[0].lower()
+
+
+
+    # server port
+
+    server=re.search(
+        r"@([^:/?#]+):(\d+)",
+        node
+    )
+
+
+    if server:
+
+        return (
+            "server:"
+            +
+            server.group(1)
+            +
+            ":"
+            +
+            server.group(2)
+        )
+
+
+
+    # 普通SS格式
+
+    server=re.search(
+        r"([^:/]+):(\d+)",
+        node
+    )
+
+
+    if server:
+
+        return (
+            "server:"
+            +
+            server.group(1)
+            +
+            ":"
+            +
+            server.group(2)
+        )
+
+
+
+    return node[:80]
+
+
+
+
+def clean_nodes(nodes):
+
+    result=[]
+
+    seen=set()
+
+
+
+    for node in nodes:
+
+
+        key=node_key(node)
+
+
+        if key in seen:
+
+            continue
+
+
+
+        seen.add(key)
+
+
+        result.append(node)
+
+
+
+    return result
+
+
+
+
+def save(nodes):
+
+
+    os.makedirs(
+        "output",
+        exist_ok=True
+    )
+
+
+    # 强制清空旧文件
+
+    if os.path.exists(OUTPUT):
+
+        open(
+            OUTPUT,
+            "w",
+            encoding="utf-8"
+        ).close()
+
+
+
+    # 全新写入
+
+    with open(
+        OUTPUT,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+
+        for n in nodes:
+
+            f.write(
+                n.strip()
+                +
+                "\n"
+            )
 
 
 
@@ -141,24 +263,7 @@ def main():
     print("读取节点...")
 
 
-    if not os.path.exists(INPUT):
-
-        print(
-            "不存在:",
-            INPUT
-        )
-
-        return
-
-
-
-    with open(
-        INPUT,
-        encoding="utf-8"
-    ) as f:
-
-        raw=f.read()
-
+    raw=read_file()
 
 
     print(
@@ -178,74 +283,27 @@ def main():
 
 
 
-    result=[]
-
-    seen=set()
-
-
-
-    for node in nodes:
-
-
-        key=node_key(node)
-
-
-        if key is None:
-
-            continue
-
-
-
-        if key not in seen:
-
-            seen.add(key)
-
-            result.append(node)
-
-
+    clean=clean_nodes(nodes)
 
 
     print(
         "去重后:",
-        len(result)
+        len(clean)
     )
 
 
 
-    # 删除旧文件
-
-    if os.path.exists(OUTPUT):
-
-        os.remove(OUTPUT)
-
-
-
-    os.makedirs(
-        "output",
-        exist_ok=True
-    )
-
-
-
-    with open(
-        OUTPUT,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-
-        for node in result:
-
-            f.write(
-                node+"\n"
-            )
-
+    save(clean)
 
 
     print(
         "输出完成:",
-        OUTPUT
+        OUTPUT,
+        "数量:",
+        len(clean)
     )
+
+
 
 
 if __name__=="__main__":
