@@ -4,7 +4,6 @@ import os
 
 sources="sources.txt"
 
-
 output="output/raw_nodes.txt"
 
 
@@ -20,7 +19,7 @@ def main():
 
     if not os.path.exists(sources):
 
-        print("没有sources.txt")
+        print("没有 sources.txt")
 
         return
 
@@ -42,35 +41,50 @@ def main():
     all_nodes=[]
 
 
+    print("发现订阅数量:",len(urls))
+
+
     for url in urls:
 
 
         try:
 
-            print(
-                "抓取:",
-                url
-            )
+            print("===================")
+
+            print("下载:",url)
 
 
             r=requests.get(
                 url,
                 headers=headers,
-                timeout=20
+                timeout=30
             )
 
 
-            text=r.text
+            print(
+                "状态:",
+                r.status_code
+            )
 
 
-            all_nodes.append(text)
+            print(
+                "长度:",
+                len(r.text)
+            )
 
+
+            if len(r.text)>10:
+
+                all_nodes.append(
+                    r.text
+                )
 
 
         except Exception as e:
 
+
             print(
-                "失败:",
+                "错误:",
                 e
             )
 
@@ -92,6 +106,12 @@ def main():
         f.write(
             "\n".join(all_nodes)
         )
+
+
+    print(
+        "最终写入:",
+        output
+    )
 
 
 
