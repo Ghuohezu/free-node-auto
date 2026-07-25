@@ -1,118 +1,107 @@
 import requests
-import os
 import base64
-import json
-import urllib.parse
 import re
+import os
+import yaml
+from urllib.parse import urlparse
 
 
-SOURCE_FILE = "config/sources.txt"
-OUTPUT_FILE = "output/nodes.txt"
+SOURCE_FILE="config/sources.txt"
+OUTPUT_FILE="output/nodes.txt"
 
+
+nodes=[]
 
 
 def download(url):
 
     try:
-
         r=requests.get(
             url,
-            timeout=20,
+            timeout=15,
             headers={
                 "User-Agent":"Mozilla/5.0"
             }
         )
 
+        r.raise_for_status()
 
-        if r.status_code==200:
-
-            text=r.text.strip()
-
-            return parse_sub(text)
-
+        return r.text
 
     except Exception as e:
-
-        print(
-            "下载失败:",
-            url,
-            e
-        )
+        print("下载失败:",url,e)
+        return ""
 
 
-    return []
-
-
-
-
-def parse_sub(text):
-
-    nodes=[]
-
-
-    # 已经是节点格式
-
-    if (
-        "://" in text
-    ):
-
-        nodes.extend(
-            text.splitlines()
-        )
-
-        return nodes
-
-
-
-    # Base64订阅
+def decode_base64(text):
 
     try:
+        raw=base64.b64decode(
+            text + "="*((4-len(text)%4)%4)
+        )
 
-        decode=base64.b64decode(
-            text+
-            "="*((4-len(text)%4)%4)
-        ).decode(
+        return raw.decode(
             "utf-8",
             errors="ignore"
         )
 
+    except:
+        return text
 
-        nodes.extend(
-            decode.splitlines()
+
+
+def extract(text):
+
+    result=[]
+
+
+    # vless vmess ss trojan
+    urls=re.findall(
+        r'(?:vmess|vless|ss|trojan)://[^\s]+',
+        text
+    )
+
+
+    result.extend(urls)
+
+
+    # base64再次解析
+
+    if len(result)==0:
+
+        decoded=decode_base64(text)
+
+        urls=re.findall(
+            r'(?:vmess|vless|ss|trojan)://[^\s]+',
+            decoded
         )
 
-
-    except:
-
-        pass
+        result.extend(urls)
 
 
-    return nodes
-
+    return result
 
 
 
 def node_key(node):
 
+    """
+    核心去重
+    """
 
-    try:
+    # vless
 
-        url=urllib.parse.urlparse(node)
+    if node.startswith("vless://"):
 
+        try:
 
-        scheme=url.scheme.lower()
+            body=node[8:]
 
+            uuid=body.split("@")[0]
 
+            server=body.split("@")[1].split(":")[0]
 
-        # VLESS
-
-        if scheme=="vless":
-
-            uuid=node.split("://")[1].split("@")[0]
-
-            server=url.hostname
-
-            port=url.port
+            port=body.split("@")[1].split(":")[1].split("?")[0]
 
 
             return (
@@ -122,68 +111,49 @@ def node_key(node):
                 uuid
             )
 
+        except:
+            pass
 
 
-        # VMESS
+    # trojan
 
-        if scheme=="vmess":
+    if node.startswith("trojan://"):
 
-            return node
+        try:
 
+            body=node[9:]
 
+            pwd=body.split("@")[0]
 
-        # TROJAN
+            server=body.split("@")[1].split(":")[0]
 
-        if scheme=="trojan":
+            port=body.split("@")[1].split(":")[1].split("?")[0]
 
-            password=node.split("://")[1].split("@")[0]
 
             return (
                 "trojan",
-                url.hostname,
-                url.port,
-                password
+                server,
+                port,
+                pwd
             )
 
-
-
-        # SS
-
-        if scheme=="ss":
-
-            return (
-                "ss",
-                url.hostname,
-                url.port,
-                node.split("@")[0]
-            )
+        except:
+            pass
 
 
 
-    except:
-
-        pass
-
-
-
-    # 普通文本
+    # 普通fallback
 
     return node
 
 
 
-
 def main():
-
-
-    all_nodes=[]
-
 
     with open(
         SOURCE_FILE,
-        encoding="utf-8"
+        encoding="utf8"
     ) as f:
-
 
         urls=[
             x.strip()
@@ -192,63 +162,40 @@ def main():
         ]
 
 
-
     for url in urls:
-
 
         print(
             "抓取:",
             url
         )
 
+        text=download(url)
 
-        nodes=download(url)
-
-
-        print(
-            "获得:",
-            len(nodes)
+        nodes.extend(
+            extract(text)
         )
 
 
-        all_nodes.extend(nodes)
-
-
-
     print(
-        "总节点:",
-        len(all_nodes)
+        "原始节点:",
+        len(nodes)
     )
 
 
+    clean=[]
 
-    result={}
-
-
-
-    for n in all_nodes:
+    seen=set()
 
 
-        n=n.strip()
-
-
-        if not n:
-            continue
-
+    for n in nodes:
 
         key=node_key(n)
 
+        if key not in seen:
 
-        if key not in result:
+            seen.add(key)
 
-            result[key]=n
-
-
-
-
-    clean=list(
-        result.values()
-    )
+            clean.append(n)
 
 
 
@@ -256,7 +203,6 @@ def main():
         "去重后:",
         len(clean)
     )
-
 
 
     os.makedirs(
@@ -268,16 +214,14 @@ def main():
     with open(
         OUTPUT_FILE,
         "w",
-        encoding="utf-8"
+        encoding="utf8"
     ) as f:
 
+        for n in clean:
 
-        f.write(
-            "\n".join(clean)
-        )
+            f.write(n+"\n")
 
 
 
 if __name__=="__main__":
-
     main()
