@@ -1,1 +1,74 @@
 
+name: Update Free Nodes
+
+
+on:
+
+  schedule:
+
+    - cron: "0 */6 * * *"
+
+
+  workflow_dispatch:
+
+
+
+permissions:
+
+  contents: write
+
+
+
+jobs:
+
+
+  update:
+
+
+    runs-on: ubuntu-latest
+
+
+    steps:
+
+
+      - name: Checkout
+
+        uses: actions/checkout@v4
+
+
+
+      - name: Setup Python
+
+        uses: actions/setup-python@v5
+
+        with:
+
+          python-version: "3.11"
+
+
+
+      - name: Install dependencies
+
+        run: |
+
+          pip install requests pyyaml
+
+
+
+      - name: Fetch nodes
+
+        run: |
+
+          python scripts/clean_nodes.py
+
+
+
+      - name: Commit update
+
+        uses: stefanzweifel/git-auto-commit-action@v5
+
+        with:
+
+          commit_message: "Auto update nodes"
+
+          file_pattern: output/nodes.txt
