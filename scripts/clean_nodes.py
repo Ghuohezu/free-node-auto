@@ -1,98 +1,28 @@
-import os
 import re
-import base64
-import yaml
+import os
 
 
-INPUT_FILES = [
-    "sources.txt",
-    "nodes.txt",
-    "output/raw_nodes.txt",
-    "output/nodes_raw.txt"
-]
-
+INPUT_FILE = "nodes.txt"
 OUTPUT_FILE = "output/nodes.txt"
-
-
-def read_files():
-
-    data = ""
-
-    for file in INPUT_FILES:
-
-        if os.path.exists(file):
-
-            try:
-                with open(file,"r",encoding="utf-8") as f:
-                    data += "\n" + f.read()
-
-            except:
-                pass
-
-    return data
-
-
-
-def decode_base64(text):
-
-    result=[]
-
-    for line in text.splitlines():
-
-        line=line.strip()
-
-        if len(line)<20:
-            continue
-
-
-        try:
-
-            if re.match(r'^[A-Za-z0-9+/=]+$',line):
-
-                decode=base64.b64decode(
-                    line+"==="
-
-                ).decode(
-                    "utf-8",
-                    errors="ignore"
-                )
-
-                if "://" in decode:
-
-                    result.append(decode)
-
-
-        except:
-
-            pass
-
-
-    return result
-
 
 
 def extract_nodes(text):
 
+    patterns = [
+
+        r"(vmess://[^\s]+)",
+        r"(vless://[^\s]+)",
+        r"(trojan://[^\s]+)",
+        r"(ss://[^\s]+)",
+        r"(hysteria://[^\s]+)",
+        r"(hy2://[^\s]+)"
+
+    ]
+
     nodes=[]
 
-
-    # 原始 URI
-
-    for line in text.splitlines():
-
-        line=line.strip()
-
-        if "://" in line:
-
-            nodes.append(line)
-
-
-
-    # base64
-
-    nodes.extend(
-        decode_base64(text)
-    )
+    for p in patterns:
+        nodes += re.findall(p,text)
 
 
     return nodes
@@ -102,131 +32,38 @@ def extract_nodes(text):
 def node_key(node):
 
     """
-    节点唯一识别
+    核心去重
+    不看名字
     """
 
-    server=""
-    port=""
-    uuid=""
-    password=""
+    try:
 
+        # 去掉名字
+        base=node.split("#")[0]
 
-    # server
+        return base
 
-    m=re.search(
-        r'@([^:/?#]+)',
-        node
-    )
+    except:
 
-    if m:
-        server=m.group(1)
-
-
-    # port
-
-    m=re.search(
-        r'@[^:]+:(\d+)',
-        node
-    )
-
-    if m:
-        port=m.group(1)
-
-
-    # uuid
-
-    m=re.search(
-        r'[0-9a-fA-F-]{32,}',
-        node
-    )
-
-    if m:
-        uuid=m.group(0)
-
-
-    # password
-
-    if "ss://" in node:
-
-        try:
-
-            password=node.split("@")[0]
-
-            password=password[-30:]
-
-        except:
-
-            pass
-
-
-    return (
-        server,
-        port,
-        uuid,
-        password
-    )
+        return node
 
 
 
-def clean(nodes):
-
-
-    result=[]
-
-    seen=set()
-
-
-    for n in nodes:
-
-
-        key=node_key(n)
-
-
-        if key in seen:
-
-            continue
-
-
-        seen.add(key)
-
-        result.append(n)
-
-
-    return result
-
-
-
-
-def save(nodes):
-
-
-    os.makedirs(
-        "output",
-        exist_ok=True
-    )
-
-
-    with open(
-        OUTPUT_FILE,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-
-        for n in nodes:
-
-            f.write(n+"\n")
-
-
-
-
-if __name__=="__main__":
-
+def main():
 
     print("读取节点...")
 
 
-    text=read_files()
+    if not os.path.exists(INPUT_FILE):
+        print("没有nodes.txt")
+        return
+
+
+    text=open(
+        INPUT_FILE,
+        encoding="utf-8",
+        errors="ignore"
+    ).read()
 
 
     print(
@@ -244,19 +81,56 @@ if __name__=="__main__":
     )
 
 
-    nodes=clean(nodes)
+
+    result=[]
+
+    seen=set()
+
+
+    for n in nodes:
+
+        key=node_key(n)
+
+        if key not in seen:
+
+            seen.add(key)
+            result.append(n)
+
 
 
     print(
         "去重后:",
-        len(nodes)
+        len(result)
     )
 
 
-    save(nodes)
+
+    os.makedirs(
+        "output",
+        exist_ok=True
+    )
+
+
+    # 注意这里必须w
+    with open(
+        OUTPUT_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+
+        for n in result:
+
+            f.write(n+"\n")
+
 
 
     print(
         "输出完成:",
         OUTPUT_FILE
     )
+
+
+
+if __name__=="__main__":
+    main()
