@@ -15,6 +15,7 @@ jobs:
 
   update:
 
+
     runs-on: ubuntu-latest
 
 
@@ -47,7 +48,7 @@ jobs:
 
 
 
-    - name: Install Python
+    - name: Install
 
       run: |
 
@@ -58,8 +59,6 @@ jobs:
     - name: Fetch Nodes
 
       run: |
-
-        mkdir -p output
 
         python scripts/fetch_nodes.py
 
@@ -73,11 +72,11 @@ jobs:
 
 
 
-    - name: Check Result
+    - name: Check Output
 
       run: |
 
-        echo "最终节点数量"
+        echo "======最终节点======"
 
         wc -l output/nodes.txt
 
@@ -85,14 +84,17 @@ jobs:
 
     - name: Commit
 
-      uses: stefanzweifel/git-auto-commit-action@v5
+      run: |
 
-      with:
+        git config user.name "github-actions[bot]"
 
-        commit_message: "自动更新节点"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-        file_pattern: |
 
-          output/nodes.txt
+        git add output/nodes.txt
 
-        push_options: --force
+
+        git commit -m "自动更新节点" || echo "没有变化"
+
+
+        git push origin main --force
