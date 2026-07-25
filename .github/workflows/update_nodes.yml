@@ -47,7 +47,7 @@ jobs:
 
 
 
-    - name: Install dependencies
+    - name: Install Python
 
       run: |
 
@@ -55,19 +55,17 @@ jobs:
 
 
 
-    - name: Download nodes
+    - name: Fetch Nodes
 
       run: |
 
         mkdir -p output
 
-        touch nodes.txt
-
         python scripts/fetch_nodes.py
 
 
 
-    - name: Clean nodes
+    - name: Clean Nodes
 
       run: |
 
@@ -75,7 +73,17 @@ jobs:
 
 
 
-    - name: Commit result
+    - name: Check Result
+
+      run: |
+
+        echo "最终节点数量"
+
+        wc -l output/nodes.txt
+
+
+
+    - name: Commit
 
       uses: stefanzweifel/git-auto-commit-action@v5
 
