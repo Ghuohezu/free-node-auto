@@ -66,10 +66,18 @@ jobs:
 
 
 
-    - name: Commit Nodes
+      - name: Commit and push
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          git pull --rebase origin main
 
-      uses: stefanzweifel/git-auto-commit-action@v6
+          git add output/nodes.txt
+
+          git commit -m "自动更新节点" || exit 0
+
+          git push origin main
 
 
       with:
