@@ -1,208 +1,203 @@
-import requests
-import base64
-import re
 import os
+import re
+import base64
 import yaml
-from urllib.parse import urlparse
 
 
-SOURCE_FILE="config/sources.txt"
-OUTPUT_FILE="output/nodes.txt"
+INPUT_FILES = [
+    "sources.txt",
+    "nodes.txt",
+    "output/raw_nodes.txt",
+    "output/nodes_raw.txt"
+]
+
+OUTPUT_FILE = "output/nodes.txt"
 
 
-nodes=[]
+def read_files():
 
+    data = ""
 
-def download(url):
+    for file in INPUT_FILES:
 
-    try:
-        r=requests.get(
-            url,
-            timeout=15,
-            headers={
-                "User-Agent":"Mozilla/5.0"
-            }
-        )
+        if os.path.exists(file):
 
-        r.raise_for_status()
+            try:
+                with open(file,"r",encoding="utf-8") as f:
+                    data += "\n" + f.read()
 
-        return r.text
+            except:
+                pass
 
-    except Exception as e:
-        print("下载失败:",url,e)
-        return ""
+    return data
+
 
 
 def decode_base64(text):
 
-    try:
-        raw=base64.b64decode(
-            text + "="*((4-len(text)%4)%4)
-        )
-
-        return raw.decode(
-            "utf-8",
-            errors="ignore"
-        )
-
-    except:
-        return text
-
-
-
-def extract(text):
-
     result=[]
 
+    for line in text.splitlines():
 
-    # vless vmess ss trojan
-    urls=re.findall(
-        r'(?:vmess|vless|ss|trojan)://[^\s]+',
-        text
-    )
+        line=line.strip()
 
-
-    result.extend(urls)
+        if len(line)<20:
+            continue
 
 
-    # base64再次解析
+        try:
 
-    if len(result)==0:
+            if re.match(r'^[A-Za-z0-9+/=]+$',line):
 
-        decoded=decode_base64(text)
+                decode=base64.b64decode(
+                    line+"==="
 
-        urls=re.findall(
-            r'(?:vmess|vless|ss|trojan)://[^\s]+',
-            decoded
-        )
+                ).decode(
+                    "utf-8",
+                    errors="ignore"
+                )
 
-        result.extend(urls)
+                if "://" in decode:
+
+                    result.append(decode)
+
+
+        except:
+
+            pass
 
 
     return result
 
 
 
-def node_key(node):
+def extract_nodes(text):
 
-    """
-    核心去重
-    """
-
-    # vless
-
-    if node.startswith("vless://"):
-
-        try:
-
-            body=node[8:]
-
-            uuid=body.split("@")[0]
-
-            server=body.split("@")[1].split(":")[0]
-
-            port=body.split("@")[1].split(":")[1].split("?")[0]
+    nodes=[]
 
 
-            return (
-                "vless",
-                server,
-                port,
-                uuid
-            )
+    # 原始 URI
 
-        except:
-            pass
+    for line in text.splitlines():
 
+        line=line.strip()
 
-    # trojan
+        if "://" in line:
 
-    if node.startswith("trojan://"):
-
-        try:
-
-            body=node[9:]
-
-            pwd=body.split("@")[0]
-
-            server=body.split("@")[1].split(":")[0]
-
-            port=body.split("@")[1].split(":")[1].split("?")[0]
-
-
-            return (
-                "trojan",
-                server,
-                port,
-                pwd
-            )
-
-        except:
-            pass
+            nodes.append(line)
 
 
 
-    # 普通fallback
+    # base64
 
-    return node
-
-
-
-def main():
-
-    with open(
-        SOURCE_FILE,
-        encoding="utf8"
-    ) as f:
-
-        urls=[
-            x.strip()
-            for x in f
-            if x.strip()
-        ]
-
-
-    for url in urls:
-
-        print(
-            "抓取:",
-            url
-        )
-
-        text=download(url)
-
-        nodes.extend(
-            extract(text)
-        )
-
-
-    print(
-        "原始节点:",
-        len(nodes)
+    nodes.extend(
+        decode_base64(text)
     )
 
 
-    clean=[]
+    return nodes
+
+
+
+def node_key(node):
+
+    """
+    节点唯一识别
+    """
+
+    server=""
+    port=""
+    uuid=""
+    password=""
+
+
+    # server
+
+    m=re.search(
+        r'@([^:/?#]+)',
+        node
+    )
+
+    if m:
+        server=m.group(1)
+
+
+    # port
+
+    m=re.search(
+        r'@[^:]+:(\d+)',
+        node
+    )
+
+    if m:
+        port=m.group(1)
+
+
+    # uuid
+
+    m=re.search(
+        r'[0-9a-fA-F-]{32,}',
+        node
+    )
+
+    if m:
+        uuid=m.group(0)
+
+
+    # password
+
+    if "ss://" in node:
+
+        try:
+
+            password=node.split("@")[0]
+
+            password=password[-30:]
+
+        except:
+
+            pass
+
+
+    return (
+        server,
+        port,
+        uuid,
+        password
+    )
+
+
+
+def clean(nodes):
+
+
+    result=[]
 
     seen=set()
 
 
     for n in nodes:
 
+
         key=node_key(n)
 
-        if key not in seen:
 
-            seen.add(key)
+        if key in seen:
 
-            clean.append(n)
-
+            continue
 
 
-    print(
-        "去重后:",
-        len(clean)
-    )
+        seen.add(key)
+
+        result.append(n)
+
+
+    return result
+
+
+
+
+def save(nodes):
 
 
     os.makedirs(
@@ -214,14 +209,54 @@ def main():
     with open(
         OUTPUT_FILE,
         "w",
-        encoding="utf8"
+        encoding="utf-8"
     ) as f:
 
-        for n in clean:
+
+        for n in nodes:
 
             f.write(n+"\n")
 
 
 
+
 if __name__=="__main__":
-    main()
+
+
+    print("读取节点...")
+
+
+    text=read_files()
+
+
+    print(
+        "原始长度:",
+        len(text)
+    )
+
+
+    nodes=extract_nodes(text)
+
+
+    print(
+        "发现节点:",
+        len(nodes)
+    )
+
+
+    nodes=clean(nodes)
+
+
+    print(
+        "去重后:",
+        len(nodes)
+    )
+
+
+    save(nodes)
+
+
+    print(
+        "输出完成:",
+        OUTPUT_FILE
+    )
