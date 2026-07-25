@@ -20,7 +20,6 @@ jobs:
     runs-on: ubuntu-latest
 
 
-
     permissions:
 
       contents: write
@@ -50,7 +49,7 @@ jobs:
 
 
 
-    - name: Install
+    - name: Install dependencies
 
       run: |
 
@@ -66,32 +65,22 @@ jobs:
 
 
 
-      - name: Commit and push
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+    - name: Commit and push
 
-          git pull --rebase origin main
+      run: |
 
-          git add output/nodes.txt
+        git config --global user.name "github-actions[bot]"
 
-          git commit -m "自动更新节点" || exit 0
-
-          git push origin main
+        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
 
-      with:
-
-        commit_message:
-
-          "Auto update nodes"
+        git pull --rebase origin main
 
 
-        file_pattern:
-
-          output/nodes.txt
+        git add output/nodes.txt
 
 
-        push_options:
+        git commit -m "自动更新节点" || exit 0
 
-          --force
+
+        git push origin main
