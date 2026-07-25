@@ -76,7 +76,7 @@ jobs:
 
       run: |
 
-        echo "======最终节点======"
+        echo "===== 节点数量 ====="
 
         wc -l output/nodes.txt
 
