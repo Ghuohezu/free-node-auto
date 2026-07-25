@@ -2,7 +2,7 @@ import requests
 import os
 
 
-sources="sources.txt"
+sources="config/sources.txt"
 
 output="output/raw_nodes.txt"
 
