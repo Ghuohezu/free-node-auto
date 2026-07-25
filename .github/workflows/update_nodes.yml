@@ -13,9 +13,7 @@ on:
 
 jobs:
 
-
   update:
-
 
     runs-on: ubuntu-latest
 
@@ -49,32 +47,27 @@ jobs:
 
 
 
-- name: Commit
-  uses: stefanzweifel/git-auto-commit-action@v5
-  with:
+    - name: Install dependencies
 
-    commit_message: "自动更新节点"
+      run: |
 
-    file_pattern: |
-      output/nodes.txt
-
-    push_options: --force
+        pip install requests pyyaml
 
 
 
-    - name: Download Sources
+    - name: Download nodes
 
       run: |
 
         mkdir -p output
 
-        touch output/raw_nodes.txt
+        touch nodes.txt
 
         python scripts/fetch_nodes.py
 
 
 
-    - name: Clean Nodes
+    - name: Clean nodes
 
       run: |
 
@@ -82,7 +75,7 @@ jobs:
 
 
 
-    - name: Commit
+    - name: Commit result
 
       uses: stefanzweifel/git-auto-commit-action@v5
 
@@ -90,6 +83,8 @@ jobs:
 
         commit_message: "自动更新节点"
 
-        file_pattern: output/nodes.txt
+        file_pattern: |
+
+          output/nodes.txt
 
         push_options: --force
