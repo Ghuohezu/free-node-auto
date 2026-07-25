@@ -1,47 +1,84 @@
 import requests
 import os
+import base64
 
 
-sources="config/sources.txt"
+SOURCES="config/sources.txt"
 
-output="output/raw_nodes.txt"
+OUTPUT="output/raw_nodes.txt"
 
 
 headers={
-    "User-Agent":
-    "Mozilla/5.0"
+    "User-Agent":"Mozilla/5.0"
 }
+
+
+
+def decode_base64(text):
+
+    result=[]
+
+    try:
+
+        raw=text.replace("\n","").replace("\r","")
+
+        data=base64.b64decode(
+            raw+"==="
+        ).decode(
+            "utf-8",
+            errors="ignore"
+        )
+
+
+        if "://" in data:
+
+            result.append(data)
+
+
+    except:
+
+        pass
+
+
+    return result
 
 
 
 def main():
 
 
-    if not os.path.exists(sources):
+    if not os.path.exists(SOURCES):
 
-        print("没有 sources.txt")
+        print(
+            "没有找到:",
+            SOURCES
+        )
 
         return
 
 
 
     with open(
-        sources,
+        SOURCES,
         encoding="utf-8"
     ) as f:
 
         urls=[
             x.strip()
-            for x in f.readlines()
+            for x in f
             if x.strip()
         ]
 
 
 
-    all_nodes=[]
+    print(
+        "订阅数量:",
+        len(urls)
+    )
 
 
-    print("发现订阅数量:",len(urls))
+    result=[]
+
 
 
     for url in urls:
@@ -49,9 +86,10 @@ def main():
 
         try:
 
-            print("===================")
-
-            print("下载:",url)
+            print(
+                "抓取:",
+                url
+            )
 
 
             r=requests.get(
@@ -63,28 +101,33 @@ def main():
 
             print(
                 "状态:",
-                r.status_code
-            )
-
-
-            print(
+                r.status_code,
                 "长度:",
                 len(r.text)
             )
 
 
-            if len(r.text)>10:
+            text=r.text
 
-                all_nodes.append(
-                    r.text
-                )
+
+            # 原始
+
+            result.append(text)
+
+
+
+            # base64
+
+            result.extend(
+                decode_base64(text)
+            )
+
 
 
         except Exception as e:
 
-
             print(
-                "错误:",
+                "失败:",
                 e
             )
 
@@ -97,22 +140,23 @@ def main():
 
 
     with open(
-        output,
+        OUTPUT,
         "w",
         encoding="utf-8"
     ) as f:
 
 
-        f.write(
-            "\n".join(all_nodes)
-        )
+        for item in result:
+
+            f.write(
+                item+"\n"
+            )
 
 
     print(
-        "最终写入:",
-        output
+        "生成:",
+        OUTPUT
     )
-
 
 
 if __name__=="__main__":
