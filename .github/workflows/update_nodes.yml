@@ -1,9 +1,10 @@
 name: Update Free Nodes
 
 
-on:
+'on':
 
   workflow_dispatch:
+
 
   schedule:
 
