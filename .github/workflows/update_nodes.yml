@@ -7,94 +7,125 @@ on:
 
   schedule:
 
+    # 每6小时运行一次
     - cron: "0 */6 * * *"
 
 
 
+permissions:
+
+  contents: write
+
+
+
 jobs:
+
 
   update:
 
 
     runs-on: ubuntu-latest
 
-
-    permissions:
-
-      contents: write
+    timeout-minutes: 10
 
 
 
     steps:
 
 
-    - name: Checkout
+      - name: Checkout
 
-      uses: actions/checkout@v4
+        uses: actions/checkout@v4
 
-      with:
+        with:
 
-        fetch-depth: 0
-
-
-
-    - name: Setup Python
-
-      uses: actions/setup-python@v5
-
-      with:
-
-        python-version: "3.11"
+          fetch-depth: 0
 
 
 
-    - name: Install
+      - name: Setup Python
 
-      run: |
+        uses: actions/setup-python@v5
 
-        pip install requests pyyaml
+        with:
 
-
-
-    - name: Fetch Nodes
-
-      run: |
-
-        python scripts/fetch_nodes.py
+          python-version: "3.11"
 
 
 
-    - name: Clean Nodes
+      - name: Install dependencies
 
-      run: |
+        run: |
 
-        python scripts/clean_nodes.py
+          python -m pip install --upgrade pip
 
-
-
-    - name: Check Output
-
-      run: |
-
-        echo "===== 节点数量 ====="
-
-        wc -l output/nodes.txt
+          pip install requests pyyaml
 
 
 
-    - name: Commit
+      - name: Fetch Nodes
 
-      run: |
+        run: |
 
-        git config user.name "github-actions[bot]"
+          echo "开始抓取节点"
 
-        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-
-        git add output/nodes.txt
+          python scripts/fetch_nodes.py
 
 
-        git commit -m "自动更新节点" || echo "没有变化"
+
+      - name: Clean Nodes
+
+        run: |
+
+          echo "开始清洗节点"
+
+          python scripts/clean_nodes.py
 
 
-        git push origin main --force
+
+      - name: Check Output
+
+        run: |
+
+          echo "===================="
+
+          echo "最终节点数量"
+
+          echo "===================="
+
+          wc -l output/nodes.txt
+
+          echo ""
+
+          echo "文件大小"
+
+          ls -lh output/nodes.txt
+
+
+
+      - name: Sync repository
+
+        run: |
+
+          git config user.name "github-actions[bot]"
+
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git pull --rebase origin main || true
+
+
+
+      - name: Commit and Push
+
+        run: |
+
+          git add output/nodes.txt
+
+
+          git diff --cached --quiet && echo "没有节点变化" && exit 0
+
+
+          git commit -m "自动更新节点"
+
+
+          git push origin main --force
