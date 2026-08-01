@@ -1,9 +1,5 @@
-vless://06d44c57-8e1a-41f4-b9c4-65d35869e078@api-endpoint.rest:443?type=tcp&security=reality&sni=api-endpoint.rest&flow=xtls-rprx-vision&pbk=XW9rKSbrkI0ehSHTieUsCpvhJ1_Wib9MDPZG8JafD0s&sid=19fbc4c7dd3d3d5a&fp=qq#CY%20-%20zhuhai.uk
-vless://245bb424-b186-4738-8f42-bdbde719d4c9@104.21.40.208:443?type=ws&security=tls&sni=pinalo.zenvorix.ir&path=%2Fnova-geo-psiphon-dk&host=pinalo.zenvorix.ir&fp=chrome#DK%20-%20zhuhai.uk
-vless://218fd696-e3a2-4c33-b397-a5f13a82969e@157.22.241.152:7443?type=grpc&security=reality&sni=icloud.com&host=grpc&pbk=P5eqN_q-Vq7M8YgrTIS_yZBgWLskGKQ9hAHhW__R6js&sid=89136b6e&fp=firefox#DE%20-%20zhuhai.uk
-ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpZamxpWW1GbE56Vm1NbUU0Wm1Ka1lqQXhOelEyTldVeU56WmxOamhrWkdVPQ==@163.176.225.9:59319#BR%20-%20zhuhai.uk
-vless://7c74b0e4-f132-5583-4692-622a7d6b71a4@88.218.44.4:993?type=tcp&security=reality&sni=download.nvidia.com&flow=xtls-rprx-vision&pbk=EG3y7UktGRlzSZZ2oXT_YaO2gVP4ca3Xe6AQ0u9A5DQ&fp=chrome#GB%20-%20zhuhai.uk%2002
-trojan://ba07a8af-5544-48ac-ab62-3b6c00a44fa6@hkdcrtc-e.catcat321.com:20041?allowInsecure=1&peer=de.catxstar.com#DE%20-%20zhuhai.uk%2007
+ss://YWVzLTI1Ni1nY206MjAyN2U4MzAzOTlkOGQwOA==@195.58.48.19:10910#RU%20-%20zhuhai.uk
+trojan://ba07a8af-5544-48ac-ab62-3b6c00a44fa6@oplosgru-c.catcat321.com:20004?allowInsecure=1&peer=hk.catxstar.com#JP%20-%20zhuhai.uk%2046
 trojan://UO36402987@relative-labrador.rooster465.autos:443?mux=1#%E6%96%B0%E5%8A%A0%E5%9D%A1-%E7%8B%AC%E4%BA%AB%E5%B8%A6%E5%AE%BD(157)
 trojan://UO36402987@optimum-snapper.rooster465.autos:443?mux=1#%E6%97%A5%E6%9C%AC-%E7%8B%AC%E4%BA%AB%E5%B8%A6%E5%AE%BD(153)
 trojan://UO36402987@flowing-eagle.rooster465.autos:443?mux=1#%E7%88%B1%E5%B0%94%E5%85%B0-%E7%8B%AC%E4%BA%AB%E5%B8%A6%E5%AE%BD(155)
