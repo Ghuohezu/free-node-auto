@@ -29,6 +29,9 @@ BLACKLIST_IPS = {
     "47.240.80.220",
 }
 
+# 欺诈分数阈值 (超过这个值认为是风险)
+FRAUD_SCORE_THRESHOLD = 75
+
 # IP 纯净度评分对应的 Emoji (参考 clash-ip-checker)
 PURITY_SCORE_MAPPING = {
     (0, 10): ("⚪", "极佳"),      
@@ -76,6 +79,8 @@ class IPQualityChecker:
                     result = self._parse_ippure_result(data)
                     self.cache[ip_str] = result
                     return result
+        except asyncio.TimeoutError:
+            print(f"⚠️ API 超时 ({ip_str})")
         except Exception as e:
             print(f"⚠️ API 检查失败 ({ip_str}): {str(e)[:50]}")
         
@@ -135,6 +140,11 @@ class NodeProcessor:
                 if (i + 1) % 10 == 0:
                     print(f"  处理中: {i+1}/{len(nodes)}", end='\r')
                 
+                # 验证节点格式
+                if not node or not any(p in node for p in PROTOCOLS):
+                    self.filtered_log.append(f"[格式错误] {node[:80]}")
+                    continue
+                
                 ip_str = self._extract_ip_from_node(node)
                 
                 # IP 统计
@@ -154,10 +164,12 @@ class NodeProcessor:
                 # 检查 IP 质量
                 quality_info = await self._check_node_quality(node, ip_str)
                 
-                if quality_info.get("risk_level") == "BLOCKED":
+                # 判断是否应该过滤
+                if quality_info.get("should_filter"):
                     self.stats["filtered"] += 1
+                    reason = quality_info.get("filter_reason", "未知原因")
                     self.filtered_log.append(
-                        f"[风险] {node[:80]}... | {quality_info.get('reason', 'Unknown')}"
+                        f"[过滤] {node[:80]}... | {reason}"
                     )
                     continue
                 
@@ -186,16 +198,19 @@ class NodeProcessor:
             "ip": ip_str or "❓",
             "remark": self._extract_remark(node),
             "risk_level": "CLEAN",
-            "reason": "",
+            "filter_reason": "",
+            "should_filter": False,
             "emoji": "✅",
             "attr": "未知",
             "source": "未知",
             "fraud_score": 0,
             "full_string": "",
+            "rating": "未知",
         }
         
+        # 如果是域名节点，直接返回
         if not ip_str:
-            quality["full_string"] = ""
+            quality["full_string"] = "【✅ 域名节点】"
             return quality
         
         # 调用 API 检查
@@ -216,10 +231,18 @@ class NodeProcessor:
         quality["emoji"] = emoji
         quality["rating"] = rating
         
-        # 判断是否为风险 IP
+        # 判断是否为风险 IP - VPN 或欺诈分数过高
         if api_result.get("is_vpn"):
             quality["risk_level"] = "RISKY"
-            quality["reason"] = "VPN"
+            quality["should_filter"] = True
+            quality["filter_reason"] = "VPN 节点"
+            return quality
+        
+        if fraud_score > FRAUD_SCORE_THRESHOLD:
+            quality["risk_level"] = "RISKY"
+            quality["should_filter"] = True
+            quality["filter_reason"] = f"欺诈分数过高 ({fraud_score}%)"
+            return quality
         
         # IP 属性
         if api_result.get("is_residential"):
@@ -243,48 +266,61 @@ class NodeProcessor:
     @staticmethod
     def _extract_ip_from_node(node: str) -> Optional[str]:
         """从节点中提取 IP"""
-        match = re.search(r'@([^:/?#]+)', node)
-        if match:
-            host = match.group(1)
-            # 检查是否为 IP 地址
-            if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', host):
-                return host
+        try:
+            match = re.search(r'@([^:/?#]+)', node)
+            if match:
+                host = match.group(1)
+                # 检查是否为 IP 地址
+                if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', host):
+                    return host
+        except Exception as e:
+            print(f"⚠️ 提取 IP 出错: {str(e)[:50]}")
         return None
     
     @staticmethod
     def _extract_remark(node: str) -> str:
         """提取节点备注"""
-        match = re.search(r'#(.+)$', node)
-        return match.group(1) if match else "未命名"
+        try:
+            match = re.search(r'#(.+)$', node)
+            return match.group(1) if match else "未命名"
+        except Exception:
+            return "未命名"
     
     @staticmethod
     def _get_unique_key(node: str) -> str:
         """获取去重键"""
-        uuid = re.search(
-            r'([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})',
-            node
-        )
-        if uuid:
-            return "uuid:" + uuid.group(1).lower()
-        
-        host = re.search(r'@([^:/?#]+)', node)
-        port = re.search(r':(\d{2,6})', node)
-        if host and port:
-            return "server:" + host.group(1) + ":" + port.group(1)
+        try:
+            uuid = re.search(
+                r'([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})',
+                node
+            )
+            if uuid:
+                return "uuid:" + uuid.group(1).lower()
+            
+            host = re.search(r'@([^:/?#]+)', node)
+            port = re.search(r':(\d{2,6})', node)
+            if host and port:
+                return "server:" + host.group(1) + ":" + port.group(1)
+        except Exception as e:
+            print(f"⚠️ 获取唯一键出错: {str(e)[:50]}")
         
         return node
     
     @staticmethod
     def _enhance_node_name(node: str, quality: Dict) -> str:
         """增强节点名称"""
-        if not quality.get("full_string"):
+        try:
+            if not quality.get("full_string"):
+                return node
+            
+            if '#' in node:
+                parts = node.rsplit('#', 1)
+                return f"{parts[0]}#{quality['full_string']} {parts[1]}"
+            else:
+                return f"{node}#{quality['full_string']}"
+        except Exception as e:
+            print(f"⚠️ 增强节点名称出错: {str(e)[:50]}")
             return node
-        
-        if '#' in node:
-            parts = node.rsplit('#', 1)
-            return f"{parts[0]}#{quality['full_string']} {parts[1]}"
-        else:
-            return f"{node}#{quality['full_string']}"
 
 
 def extract_nodes(text: str) -> List[str]:
@@ -292,7 +328,7 @@ def extract_nodes(text: str) -> List[str]:
     result = []
     for line in text.splitlines():
         line = line.strip()
-        if not line:
+        if not line or line.startswith("#"):  # 跳过空行和注释
             continue
         for p in PROTOCOLS:
             if p in line:
@@ -638,8 +674,12 @@ async def main():
         return
     
     # 读取文件
-    with open(INPUT, encoding="utf-8") as f:
-        text = f.read()
+    try:
+        with open(INPUT, encoding="utf-8") as f:
+            text = f.read()
+    except Exception as e:
+        print(f"❌ 读取文件失败: {e}")
+        return
     
     print(f"📊 原始文件大小: {len(text)} 字节")
     
@@ -647,9 +687,17 @@ async def main():
     nodes = extract_nodes(text)
     print(f"📝 发现节点: {len(nodes)} 个")
     
+    if not nodes:
+        print("⚠️ 未找到任何节点，请检查输入文件")
+        return
+    
     # 处理节点
     processor = NodeProcessor()
-    final_nodes, results = await processor.process(nodes)
+    try:
+        final_nodes, results = await processor.process(nodes)
+    except Exception as e:
+        print(f"❌ 处理节点失败: {e}")
+        return
     
     # 输出统计
     print("\n" + "=" * 70)
@@ -667,34 +715,47 @@ async def main():
     os.makedirs("output", exist_ok=True)
     
     # 保存节点列表
-    with open(OUTPUT, "w", encoding="utf-8") as f:
-        for node in final_nodes:
-            f.write(node + "\n")
-    print(f"\n✅ 输出完成: {OUTPUT}")
-    print(f"   文件大小: {len(final_nodes)} 条节点")
+    try:
+        with open(OUTPUT, "w", encoding="utf-8") as f:
+            for node in final_nodes:
+                f.write(node + "\n")
+        print(f"\n✅ 输出完成: {OUTPUT}")
+        print(f"   文件大小: {len(final_nodes)} 条节点")
+    except Exception as e:
+        print(f"❌ 保存节点文件失败: {e}")
+        return
     
     # 保存 JSON 结果
-    with open(RESULT_JSON, "w", encoding="utf-8") as f:
-        json.dump({
-            "stats": processor.stats,
-            "results": results
-        }, f, ensure_ascii=False, indent=2)
-    print(f"📋 JSON 结果: {RESULT_JSON}")
+    try:
+        with open(RESULT_JSON, "w", encoding="utf-8") as f:
+            json.dump({
+                "stats": processor.stats,
+                "results": results
+            }, f, ensure_ascii=False, indent=2)
+        print(f"📋 JSON 结果: {RESULT_JSON}")
+    except Exception as e:
+        print(f"⚠️ 保存 JSON 失败: {e}")
     
     # 保存 HTML 报告
-    html_path = "output/report.html"
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(generate_html_report(results, processor.stats))
-    print(f"📊 HTML 报告: {html_path}")
+    try:
+        html_path = "output/report.html"
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(generate_html_report(results, processor.stats))
+        print(f"📊 HTML 报告: {html_path}")
+    except Exception as e:
+        print(f"⚠️ 保存 HTML 报告失败: {e}")
     
     # 保存过滤日志
     if processor.filtered_log:
-        with open(FILTERED_LOG, "w", encoding="utf-8") as f:
-            f.write("过滤日志\n")
-            f.write("=" * 70 + "\n\n")
-            for log in processor.filtered_log:
-                f.write(log + "\n")
-        print(f"📋 过滤日志: {FILTERED_LOG}")
+        try:
+            with open(FILTERED_LOG, "w", encoding="utf-8") as f:
+                f.write("过滤日志\n")
+                f.write("=" * 70 + "\n\n")
+                for log in processor.filtered_log:
+                    f.write(log + "\n")
+            print(f"📋 过滤日志: {FILTERED_LOG}")
+        except Exception as e:
+            print(f"⚠️ 保存过滤日志失败: {e}")
     
     print("=" * 70)
     print("✨ 所有任务完成！")
