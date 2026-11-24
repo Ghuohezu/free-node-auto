@@ -1,132 +1,74 @@
 name: Update Free Nodes
 
-
-'on':
-
+on:
   workflow_dispatch:
-
- 
   schedule:
-
     # 每6小时运行一次
     - cron: "0 */6 * * *"
 
-
-
 permissions:
-
   contents: write
 
-
+concurrency:
+  group: update-nodes
+  cancel-in-progress: true
 
 jobs:
-
-
   update:
-
-
     runs-on: ubuntu-latest
-
-    timeout-minutes: 10
-
-
+    timeout-minutes: 20
 
     steps:
-
-
       - name: Checkout
-
         uses: actions/checkout@v4
-
         with:
-
           fetch-depth: 0
 
-
-
       - name: Setup Python
-
         uses: actions/setup-python@v5
-
         with:
-
           python-version: "3.11"
 
-
-
       - name: Install dependencies
-
         run: |
-
           python -m pip install --upgrade pip
-
-          pip install requests pyyaml
-
-
+          pip install -r requirements.txt
 
       - name: Fetch Nodes
-
         run: |
-
           echo "开始抓取节点"
-
           python scripts/fetch_nodes.py
 
-
-
       - name: Clean Nodes
-
         run: |
-
           echo "开始清洗节点"
-
           python scripts/clean_nodes.py
 
-
-
       - name: Check Output
-
         run: |
-
           echo "===================="
-
           echo "最终节点数量"
-
           echo "===================="
-
           wc -l output/nodes.txt
-
           echo ""
-
           echo "文件大小"
-
           ls -lh output/nodes.txt
-
-
+          echo ""
+          echo "清洗结果示例"
+          head -n 5 output/nodes.txt
 
       - name: Sync repository
-
         run: |
-
           git config user.name "github-actions[bot]"
-
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git pull --rebase origin main || true
 
-
-
       - name: Commit and Push
-
-        run: |
-
-          git add output/nodes.txt
-
-
-          git diff --cached --quiet && echo "没有节点变化" && exit 0
-
-
-          git commit -m "自动更新节点"
-
-
-          git push origin main --force
+        uses: stefanzweifel/git-auto-commit-action@v6
+        with:
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "41898282+github-actions[bot]@users.noreply.github.com"
+          commit_message: "自动更新节点"
+          file_pattern: "output/*"
+          skip_checkout: true
+          create_parent_directories: true

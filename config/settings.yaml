@@ -1,0 +1,59 @@
+# =========================================================
+# 节点清洗配置
+# 留空的字段会回退到脚本内置默认值（见 scripts/clean_nodes.py）
+# =========================================================
+
+# --- 风险判定 ---
+# 风险分数超过该值判定为高风险（0-100，越大越脏）
+risk_threshold: 75
+
+# 是否把判定为高风险的节点从输出中剔除
+# true  = 剔除，并单独写入 output/risky_nodes.txt
+# false = 全部保留，仅在节点名前打标签（与 clash-ip-checker 一致）
+filter_risky: true
+
+# 是否过滤被标记为 VPN 的 IP
+filter_vpn: true
+
+# 是否启用 IP 黑名单过滤
+filter_blacklist: true
+
+# IP 黑名单，命中直接剔除
+blacklist_ips:
+  - 120.227.1.43
+  - 47.240.80.220
+
+# --- 检测数据源（按顺序尝试，前一个失败自动降级到下一个）---
+# ippure : api.ippure.net，返回风险分 + 宽带类型 + IP 来源 + 共享人数
+# ipapi  : ip-api.com，备用源，返回宽带类型（机房/住宅）
+sources:
+  - ippure
+  - ipapi
+
+# --- 支持的节点协议 ---
+protocols:
+  - vmess://
+  - vless://
+  - ss://
+  - ssr://
+  - trojan://
+  - anytls://
+  - hysteria://
+  - hysteria2://
+  - hy2://
+  - hy://
+  - tuic://
+
+# --- 并发与限速 ---
+# 同时处理多少个节点
+concurrency: 16
+
+# 单个 HTTP 请求超时（秒）
+request_timeout: 8
+
+# 各数据源的请求速率上限（次/分钟），防止被限流
+rate:
+  ippure: 25
+  ipapi: 40
+
+user_agent: "Mozilla/5.0 (X11; Linux x86_64) node-cleaner/2.0"

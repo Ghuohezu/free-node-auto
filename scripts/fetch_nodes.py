@@ -1,12 +1,16 @@
-import requests
-import os
 import base64
+import os
+import re
+from urllib.parse import unquote
+
+import requests
 
 SOURCES = "config/sources.txt"
 OUTPUT = "output/raw_nodes.txt"
 
-headers = {
-    "User-Agent": "Mozilla/5.0"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) node-fetcher/2.0",
+    "Accept": "*/*",
 }
 
 # 与 clean_nodes.py 保持一致的协议列表
@@ -16,95 +20,125 @@ PROTOCOLS = [
     "ss://",
     "ssr://",
     "trojan://",
+    "anytls://",
     "hysteria://",
     "hysteria2://",
     "hy2://",
-    "tuic://"
+    "hy://",
+    "tuic://",
 ]
 
+B64_RUN = re.compile(r"[A-Za-z0-9+/]{16,}={0,2}")
 
-def try_decode_base64(text):
-    result = []
-    try:
-        clean = text.replace("\n", "").replace("\r", "")
-        data = base64.b64decode(clean + "===").decode("utf-8", errors="ignore")
-        if "://" in data:
-            result.append(data)
-    except:
-        pass
-    return result
+
+def decode_base64_block(text: str):
+    results = []
+    clean = text.replace("\n", "").replace("\r", "")
+    if len(clean) >= 16:
+        try:
+            data = base64.b64decode(clean + "=" * (-len(clean) % 4),
+                                    validate=False).decode("utf-8", errors="ignore")
+            if "://" in data:
+                results.append(data)
+        except Exception:
+            pass
+
+    for match in B64_RUN.findall(text):
+        try:
+            data = base64.b64decode(match + "=" * (-len(match) % 4),
+                                    validate=False).decode("utf-8", errors="ignore")
+            if "://" in data:
+                results.append(data)
+        except Exception:
+            continue
+    return results
 
 
 def is_direct_node_line(line: str) -> bool:
-    """
-    判断配置行是否为直接的节点链接（例如 vmess://xxx）或其它非 http(s) 协议的链接。
-    """
-    if not line:
-        return False
     low = line.lower().strip()
     for p in PROTOCOLS:
         if low.startswith(p):
             return True
-    # 若包含 :// 但不是 http(s) 开头，则认为是直接节点或非订阅链接（比如 vmess://、ss:// 等）
     if "://" in low and not low.startswith(("http://", "https://", "ftp://", "ftps://")):
         return True
     return False
 
 
-def main():
-    os.makedirs("output", exist_ok=True)
-
-    if not os.path.exists(SOURCES):
-        print("没有 sources.txt")
-        return
-
+def read_sources(path: str):
+    if not os.path.exists(path):
+        return []
     urls = []
-    with open(SOURCES, encoding="utf-8") as f:
+    seen = set()
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
+            if line in seen:
+                continue
+            seen.add(line)
             urls.append(line)
+    return urls
 
-    print("订阅/来源数量:", len(urls))
 
-    nodes = []
+def ingest_text(chunks, text):
+    chunks.append(text)
+    chunks.extend(decode_base64_block(text))
 
-    for src in urls:
+
+def main():
+    os.makedirs("output", exist_ok=True)
+
+    sources = read_sources(SOURCES)
+    print(f"订阅/来源数量: {len(sources)}")
+
+    chunks = []
+    for src in sources:
         try:
-            # 如果配置里直接写了节点（vmess://... 或其他协议），直接当作节点加入
             if is_direct_node_line(src):
-                print("直接节点行, 添加:", src if len(src) < 120 else src[:120] + "...")
-                nodes.append(src)
+                chunks.append(src)
                 continue
 
-            # 如果配置项是一个本地文件路径，读取文件内容
             if os.path.exists(src) and os.path.isfile(src):
-                print("读取本地文件:", src)
+                print(f"读取本地文件: {src}")
                 with open(src, encoding="utf-8") as fh:
-                    text = fh.read()
-                nodes.append(text)
-                nodes.extend(try_decode_base64(text))
+                    ingest_text(chunks, fh.read())
                 continue
 
-            # 否则按 URL 抓取（原有行为）
-            print("抓取 URL:", src)
-            r = requests.get(src, headers=headers, timeout=30)
-            print("状态:", r.status_code, "长度:", len(r.text))
-            text = r.text
-            nodes.append(text)
-            nodes.extend(try_decode_base64(text))
+            if not src.lower().startswith(("http://", "https://")):
+                # 非 HTTP 来源：伪协议订阅串或 base64 编码的订阅内容，按节点文本处理
+                ingest_text(chunks, src)
+                continue
+
+            print(f"抓取 URL: {src}")
+            resp = requests.get(
+                src, headers=HEADERS, timeout=30,
+                allow_redirects=True, stream=True
+            )
+            text = unquote(resp.text)
+            print(f"  状态: {resp.status_code} 长度: {len(text)}")
+            ingest_text(chunks, text)
 
         except Exception as e:
-            print("失败:", e)
+            print(f"  失败: {e}")
 
-    # 将所有原始抓取内容（包含直接节点行、订阅页面、解码出的节点）写到 output/raw_nodes.txt
+    nodes = []
+    seen = set()
+    for chunk in chunks:
+        for line in chunk.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            if line in seen:
+                continue
+            seen.add(line)
+            nodes.append(line)
+
     with open(OUTPUT, "w", encoding="utf-8") as f:
-        for n in nodes:
-            # 确保每行末尾换行
-            f.write(n + "\n")
+        for node in nodes:
+            f.write(node + "\n")
 
-    print("生成:", OUTPUT)
+    print(f"\n生成: {OUTPUT} ({len(nodes)} 行，去重后)")
 
 
 if __name__ == "__main__":
