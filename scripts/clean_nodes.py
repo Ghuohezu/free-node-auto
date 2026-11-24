@@ -544,6 +544,7 @@ class NodeProcessor:
             "host": node.host,
             "port": node.port,
             "ip": ip or "❓",
+            "raw": node.raw,
             "remark_old": node.remark,
             "risk_score": risk_score,
             "fraud_score": risk_score,
@@ -632,7 +633,7 @@ class NodeProcessor:
                         "should_filter": False, "filter_reason": "", "risk_level": "UNKNOWN",
                         "label": "", "fraud_score": None, "is_vpn": False,
                         "is_residential": None, "is_datacenter": None, "is_broadcast": None,
-                        "shared_users": None, "out": node.raw,
+                        "shared_users": None, "out": node.raw, "raw": node.raw,
                     }
                     labeled = node.raw
 
@@ -756,52 +757,74 @@ def read_raw_nodes(path: str) -> List[str]:
         return f.read()
 
 
-def reverse_delete_from_sources(results: List[Dict], settings: Dict) -> int:
-    """反向删除 config/sources.txt 中纯净度高于 purity_split 的节点行。
+def is_base64_block(text: str) -> bool:
+    """判断一行是否为 base64 订阅块（长串、只含 base64 字母表、无协议头）。"""
+    if len(text) < 16:
+        return False
+    if "://" in text:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9+/=\s]+", text))
 
-    - 保留：纯净度 <= purity_split 的节点、未解析/未知的节点、订阅 URL、base64 块
-    - 删除：解析出且纯净度高于 purity_split 的直接节点行
-    返回被删除的行数。
+
+def rebuild_sources(results: List[Dict], settings: Dict) -> Dict:
+    """维护 config/sources.txt，使其成为自维护的节点池。
+
+    写回（由本次清洗结果驱动）：
+    - 纯净度 <= purity_split 的节点（含从订阅 URL/base64 解码出来的）
+    - 可达但未知（无检测结果）的节点
+    删除：
+    - 订阅 URL、base64 块（已抓取/解码完毕）
+    - 无法连接的节点、纯净度高于 purity_split 的节点、命中黑名单/风险的节点
+    保留：注释、空行、无法解析的行（按未知处理）
+    返回统计字典。
     """
     sources_file = settings["sources_file"]
-    threshold = settings["purity_split"]
+    split = settings["purity_split"]
     protocols = settings["protocols"]
-    if not os.path.exists(sources_file):
-        return 0
 
-    # 用本次运行的结果建立 host:port -> risk_score 映射
-    score_map: Dict[Tuple[str, str], int] = {}
+    keep_clean: Dict[str, str] = {}
+    keep_unknown: Dict[str, str] = {}
     for r in results:
-        host = (r.get("host") or "").lower()
-        port = str(r.get("port") or "")
+        if r.get("should_filter"):
+            continue
+        raw = r.get("raw")
+        if not raw:
+            continue
         score = r.get("risk_score")
-        if host and port and score is not None:
-            score_map[(host, port)] = int(score)
+        if score is not None and int(score) <= split:
+            keep_clean[raw] = raw
+        elif score is None:
+            keep_unknown[raw] = raw
 
-    with open(sources_file, encoding="utf-8") as f:
-        lines = f.readlines()
-
-    kept: List[str] = []
+    preamble: List[str] = []
     removed = 0
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            kept.append(line)
-            continue
-        node = parse_node(stripped, protocols)
-        if node is None:
-            # 订阅 URL / base64 块 / 无法解析的行：无法行级删除，保留
-            kept.append(line)
-            continue
-        score = score_map.get((node.host.lower(), str(node.port)))
-        if score is not None and score > threshold:
-            removed += 1
-            continue
-        kept.append(line)
+    if os.path.exists(sources_file):
+        with open(sources_file, encoding="utf-8") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    preamble.append(line)
+                    continue
+                low = stripped.lower()
+                if low.startswith(("http://", "https://")) or is_base64_block(stripped):
+                    removed += 1
+                    continue
+                node = parse_node(stripped, protocols)
+                if node is None:
+                    preamble.append(line)
+                    continue
+                if node.raw in keep_clean or node.raw in keep_unknown:
+                    continue
+                removed += 1
 
     with open(sources_file, "w", encoding="utf-8") as f:
-        f.writelines(kept)
-    return removed
+        f.writelines(preamble)
+        for raw in keep_clean.values():
+            f.write(raw + "\n")
+        for raw in keep_unknown.values():
+            f.write(raw + "\n")
+
+    return {"clean": len(keep_clean), "unknown": len(keep_unknown), "removed": removed}
 
 
 async def main():
@@ -840,7 +863,7 @@ async def main():
         print("⚠️ 未找到任何节点，请检查输入文件")
         return
 
-    dead_count = 0
+    dead_hostport: set = set()
     if settings.get("probe_reachability"):
         print("🛰 正在探测节点可达性...", flush=True)
         prober = ReachabilityProber(settings)
@@ -856,11 +879,11 @@ async def main():
 
         await asyncio.gather(*[_probe_one(n) for n in nodes])
         nodes = alive
-        dead_count = len(dead)
-        print(f"  🚫 不可达节点: {dead_count}", flush=True)
+        dead_hostport = {(node.host.lower(), str(node.port)) for node, _ in dead}
+        print(f"  🚫 不可达节点: {len(dead)}", flush=True)
 
     processor = NodeProcessor(settings)
-    processor.stats["dead"] = dead_count
+    processor.stats["dead"] = len(dead_hostport)
     final_nodes, results, _risky_nodes = await processor.process(nodes)
 
     print("\n" + "=" * 70)
@@ -903,12 +926,15 @@ async def main():
             f.write(node + "\n")
     print(f"🏢 原生机房(纯净度<={split}%): {DC_OUTPUT} ({len(dc_nodes)} 条)")
 
-    # 反向删除 sources.txt 中纯净度高于 split 的节点行
+    # 维护 sources.txt：删除 URL/base64/死节点/高纯净度节点，写回纯净与未知节点
     if settings.get("reverse_delete_sources"):
-        removed = reverse_delete_from_sources(results, settings)
-        print(f"🗑  反向删除 sources.txt: {removed} 条高纯净度(>{split}%)节点已移除")
+        stats = rebuild_sources(results, settings)
+        print(
+            f"🗑  维护 sources.txt: 删除 {stats['removed']} 条"
+            f"（URL/base64 与死/脏节点），写回 纯净 {stats['clean']} / 未知 {stats['unknown']}"
+        )
     else:
-        print("🗑  反向删除已关闭 (reverse_delete_sources: false)")
+        print("🗑  sources.txt 维护已关闭 (reverse_delete_sources: false)")
 
     print("=" * 70)
     print("✨ 所有任务完成！")

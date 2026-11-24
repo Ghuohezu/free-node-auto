@@ -154,6 +154,58 @@ def test_purity_split():
     check("住宅=10", cn.IPAPISource.__name__ == "IPAPISource")
 
 
+def test_rebuild_sources():
+    """sources.txt 自维护：URL/base64/死/脏节点删除，纯净/未知写回"""
+    import tempfile
+    settings = cn.load_settings()
+    tmpdir = tempfile.mkdtemp()
+    sp = os.path.join(tmpdir, "sources.txt")
+    raw = (
+        "# 这是注释\n"
+        "https://example.com/sub\n"
+        "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo=\n"
+        "vless://11111111-1111-1111-1111-111111111111@1.1.1.1:443#home\n"
+        "ss://YWVz@2.2.2.2:443#dc\n"
+        "trojan://pw@3.3.3.3:443#dirty\n"
+        "vless://22222222-2222-2222-2222-222222222222@4.4.4.4:443#unknown\n"
+        "trojan://pw@5.5.5.5:443#dead\n"
+        "这不是节点行\n"
+    )
+    with open(sp, "w", encoding="utf-8") as f:
+        f.write(raw)
+
+    results = [
+        {"host": "1.1.1.1", "port": "443", "risk_score": 10, "should_filter": False,
+         "is_residential": True, "raw": "vless://11111111-1111-1111-1111-111111111111@1.1.1.1:443#home"},
+        {"host": "2.2.2.2", "port": "443", "risk_score": 20, "should_filter": False,
+         "is_datacenter": True, "raw": "ss://YWVz@2.2.2.2:443#dc"},
+        # 从订阅 base64 解码出来的纯净节点，sources.txt 里没有这一行
+        {"host": "6.6.6.6", "port": "443", "risk_score": 15, "should_filter": False,
+         "is_residential": True, "raw": "vless://66666666-6666-6666-6666-666666666666@6.6.6.6:443#fromblob"},
+        {"host": "3.3.3.3", "port": "443", "risk_score": 95, "should_filter": True,
+         "is_vpn": True, "raw": "trojan://pw@3.3.3.3:443#dirty"},
+        {"host": "4.4.4.4", "port": "443", "risk_score": None, "should_filter": False,
+         "raw": "vless://22222222-2222-2222-2222-222222222222@4.4.4.4:443#unknown"},
+    ]
+    settings["sources_file"] = sp
+    stats = cn.rebuild_sources(results, settings)
+
+    with open(sp, encoding="utf-8") as f:
+        lines = [l.strip() for l in f if l.strip()]
+    check("rebuild 纯净写回(含blob)", sum(1 for l in lines if "1.1.1.1" in l) == 1
+          and sum(1 for l in lines if "2.2.2.2" in l) == 1
+          and sum(1 for l in lines if "6.6.6.6" in l) == 1, str(lines))
+    check("rebuild 未知写回", any("4.4.4.4" in l for l in lines), str(lines))
+    check("rebuild URL/base64 删除", not any("example.com" in l or "YWJj" in l for l in lines))
+    check("rebuild 死节点删除", not any("5.5.5.5" in l for l in lines))
+    check("rebuild 脏节点删除", not any("3.3.3.3" in l for l in lines))
+    check("rebuild 注释保留", any(l.startswith("#") for l in lines))
+    check("rebuild 未知行保留", any("这不是节点行" in l for l in lines))
+    check("rebuild 统计", stats["clean"] == 3 and stats["unknown"] == 1
+          and stats["removed"] == 4, str(stats))
+    return tmpdir
+
+
 def main():
     print("=" * 70)
     print("离线回归测试")
@@ -167,6 +219,7 @@ def main():
     asyncio.run(test_risk_levels())
     test_probe_classification()
     test_purity_split()
+    test_rebuild_sources()
 
     print()
     print(f"通过 {len(PASSED)} / 失败 {len(FAILED)}")

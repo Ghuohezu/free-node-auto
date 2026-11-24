@@ -27,13 +27,15 @@ filter_risky: true
 # 想让高风险节点进 output/risky_nodes.txt，需要同时把 filter_vpn 设为 false。
 filter_vpn: true
 
-# --- 反向删除 ---
-# 是否在输出后反向清理 config/sources.txt：
-# 删除纯净度高于 purity_split 的节点行（直接节点行），
-# 保留：纯净度 <= purity_split 的节点、未解析/未知的节点、订阅 URL 与 base64 块
+# --- 反向删除 / sources.txt 维护 ---
+# 是否在每次清洗后自动维护 config/sources.txt（自维护节点池）：
+# - 删除：订阅 URL、base64 块（已抓取/解码完毕）、无法连接的节点、
+#   纯净度高于 purity_split 的节点、命中黑名单/风险的节点
+# - 写回：纯净度 <= purity_split 的节点、可达但未知（无检测结果）的节点
+# - 保留：注释、空行、无法解析的行（按未知处理）
 reverse_delete_sources: true
 
-# 被反向删除的源文件路径
+# 被维护的源文件路径
 sources_file: config/sources.txt
 
 # 是否启用 IP 黑名单过滤
