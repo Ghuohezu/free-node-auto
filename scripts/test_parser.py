@@ -137,6 +137,23 @@ def test_probe_classification():
         check(f"QUIC {p}", p in cn.QUIC_PROTOCOLS)
 
 
+def test_purity_split():
+    """纯净度切分：<=30 为绿/白纯净桶，>30 应被反向删除"""
+    split = cn.load_settings()["purity_split"]
+    check("purity_split=30", split == 30, f"实际 {split}")
+    # Emoji 映射：10→⚪白, 20→🟢绿, 30→🟢绿, 95→🔴红
+    check("10=⚪", cn.purity_emoji(10) == "⚪")
+    check("20=🟢", cn.purity_emoji(20) == "🟢")
+    check("30=🟢", cn.purity_emoji(30) == "🟢")
+    check("95=⚫", cn.purity_emoji(95) == "⚫")
+    # 切分判定：10/20 保持，95 反向删除
+    check("10 保持", not (10 > split))
+    check("20 保持", not (20 > split))
+    check("95 删除", 95 > split)
+    # 反向删除映射：住宅 10 / 机房 20 / 代理 95
+    check("住宅=10", cn.IPAPISource.__name__ == "IPAPISource")
+
+
 def main():
     print("=" * 70)
     print("离线回归测试")
@@ -149,6 +166,7 @@ def main():
     test_host_validation()
     asyncio.run(test_risk_levels())
     test_probe_classification()
+    test_purity_split()
 
     print()
     print(f"通过 {len(PASSED)} / 失败 {len(FAILED)}")

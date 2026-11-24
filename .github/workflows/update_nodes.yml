@@ -53,18 +53,22 @@ jobs:
           echo "===================="
           echo "最终节点数量"
           echo "===================="
-          wc -l output/nodes.txt
+          wc -l output/home_nodes.txt output/datacenter_nodes.txt
           echo ""
           echo "文件大小"
-          ls -lh output/nodes.txt
+          ls -lh output/home_nodes.txt output/datacenter_nodes.txt
           echo ""
-          echo "清洗结果示例"
-          head -n 5 output/nodes.txt
+          echo "原生家宽示例"
+          head -n 3 output/home_nodes.txt
           echo ""
-          # 清洗产物为空直接判失败，避免把空订阅提交回仓库
-          count=$(wc -l < output/nodes.txt)
-          echo "校验节点数量: $count"
-          test "$count" -gt 0
+          echo "原生机房示例"
+          head -n 3 output/datacenter_nodes.txt
+          echo ""
+          # 两个清洗产物都为空直接判失败，避免把空订阅提交回仓库
+          home=$(wc -l < output/home_nodes.txt)
+          dc=$(wc -l < output/datacenter_nodes.txt)
+          echo "校验节点数量: 家宽=$home 机房=$dc"
+          test "$((home + dc))" -gt 0
 
       - name: Sync repository
         run: |
@@ -78,6 +82,8 @@ jobs:
           commit_user_name: "github-actions[bot]"
           commit_user_email: "41898282+github-actions[bot]@users.noreply.github.com"
           commit_message: "自动更新节点"
-          file_pattern: "output/*"
+          file_pattern: |
+            output/*
+            config/sources.txt
           skip_checkout: true
           create_parent_directories: true

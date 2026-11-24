@@ -3,9 +3,16 @@
 # 留空的字段会回退到脚本内置默认值（见 scripts/clean_nodes.py）
 # =========================================================
 
+# --- 纯净度切分 ---
+# 纯净度 = 风险分数（0-100，越小越干净）。
+# 低于或等于该值的节点才算"纯净"（绿色⚪/白色🟢图标），才会输出。
+# 高于该值的节点会被反向删除（从 config/sources.txt 移除）。
+purity_split: 30
+
 # --- 风险判定 ---
 # 风险分数超过该值判定为高风险（0-100，越大越脏）
-risk_threshold: 75
+# 与 purity_split 保持一致，避免同一节点在不同环节被不同标准对待
+risk_threshold: 30
 
 # 是否把判定为高风险的节点从输出中剔除
 # true  = 剔除，明细写入 output/filtered_nodes.log
@@ -19,6 +26,15 @@ filter_risky: true
 # 不会进入上面的风险保留分支（filter_risky 的 false 分支也就走不到）。
 # 想让高风险节点进 output/risky_nodes.txt，需要同时把 filter_vpn 设为 false。
 filter_vpn: true
+
+# --- 反向删除 ---
+# 是否在输出后反向清理 config/sources.txt：
+# 删除纯净度高于 purity_split 的节点行（直接节点行），
+# 保留：纯净度 <= purity_split 的节点、未解析/未知的节点、订阅 URL 与 base64 块
+reverse_delete_sources: true
+
+# 被反向删除的源文件路径
+sources_file: config/sources.txt
 
 # 是否启用 IP 黑名单过滤
 filter_blacklist: true

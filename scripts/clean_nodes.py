@@ -22,7 +22,8 @@ except Exception:
 
 
 INPUT = "output/raw_nodes.txt"
-OUTPUT = "output/nodes.txt"
+HOME_OUTPUT = "output/home_nodes.txt"
+DC_OUTPUT = "output/datacenter_nodes.txt"
 RISKY_OUTPUT = "output/risky_nodes.txt"
 FILTERED_LOG = "output/filtered_nodes.log"
 DEAD_LOG = "output/dead_nodes.log"
@@ -31,10 +32,13 @@ HTML_REPORT = "output/report.html"
 SETTINGS_FILE = "config/settings.yaml"
 
 DEFAULT_SETTINGS = {
-    "risk_threshold": 75,
+    "purity_split": 30,
+    "risk_threshold": 30,
     "filter_risky": True,
     "filter_vpn": True,
     "filter_blacklist": True,
+    "reverse_delete_sources": True,
+    "sources_file": "config/sources.txt",
     "sources": ["ippure", "ipapi"],
     "blacklist_ips": [
         "120.227.1.43",
@@ -394,9 +398,13 @@ class IPAPISource(IPSource):
 
         hosting = bool(data.get("hosting"))
         proxy = bool(data.get("proxy"))
+        # 纯净度评分：普通住宅/家用 IP 最干净（10），普通机房 IP 稍高（20），
+        # 被判为代理/VPN 的 IP 风险最高（95）。
+        # 这样机房节点也能落进 purity_split(30) 以内的"绿/白"纯净桶。
+        risk_score = 95 if proxy else (20 if hosting else 10)
         return {
             "ip": data.get("query", ip),
-            "risk_score": 95 if proxy else (55 if hosting else 20),
+            "risk_score": risk_score,
             "is_residential": not hosting,
             "is_datacenter": hosting,
             "is_broadcast": False,
@@ -556,6 +564,7 @@ class NodeProcessor:
             "ip_src": src,
             "label": label,
             "full_string": label,
+            "out": self.apply_label(node, label),
             "rating": emoji,
             "attr_cn": attr,
             "src_cn": src,
@@ -628,7 +637,7 @@ class NodeProcessor:
                         "should_filter": False, "filter_reason": "", "risk_level": "UNKNOWN",
                         "label": "", "fraud_score": None, "is_vpn": False,
                         "is_residential": None, "is_datacenter": None, "is_broadcast": None,
-                        "shared_users": None,
+                        "shared_users": None, "out": node.raw,
                     }
                     labeled = node.raw
 
@@ -796,6 +805,54 @@ def read_raw_nodes(path: str) -> List[str]:
         return f.read()
 
 
+def reverse_delete_from_sources(results: List[Dict], settings: Dict) -> int:
+    """反向删除 config/sources.txt 中纯净度高于 purity_split 的节点行。
+
+    - 保留：纯净度 <= purity_split 的节点、未解析/未知的节点、订阅 URL、base64 块
+    - 删除：解析出且纯净度高于 purity_split 的直接节点行
+    返回被删除的行数。
+    """
+    sources_file = settings["sources_file"]
+    threshold = settings["purity_split"]
+    protocols = settings["protocols"]
+    if not os.path.exists(sources_file):
+        return 0
+
+    # 用本次运行的结果建立 host:port -> risk_score 映射
+    score_map: Dict[Tuple[str, str], int] = {}
+    for r in results:
+        host = (r.get("host") or "").lower()
+        port = str(r.get("port") or "")
+        score = r.get("risk_score")
+        if host and port and score is not None:
+            score_map[(host, port)] = int(score)
+
+    with open(sources_file, encoding="utf-8") as f:
+        lines = f.readlines()
+
+    kept: List[str] = []
+    removed = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            kept.append(line)
+            continue
+        node = parse_node(stripped, protocols)
+        if node is None:
+            # 订阅 URL / base64 块 / 无法解析的行：无法行级删除，保留
+            kept.append(line)
+            continue
+        score = score_map.get((node.host.lower(), str(node.port)))
+        if score is not None and score > threshold:
+            removed += 1
+            continue
+        kept.append(line)
+
+    with open(sources_file, "w", encoding="utf-8") as f:
+        f.writelines(kept)
+    return removed
+
+
 async def main():
     print("=" * 70)
     print("🚀 节点清洗脚本 (clash-ip-checker 风格标注版)")
@@ -870,10 +927,37 @@ async def main():
 
     os.makedirs("output", exist_ok=True)
 
-    with open(OUTPUT, "w", encoding="utf-8") as f:
-        for node in final_nodes:
+    # 切分纯净度 <= purity_split 的家宽/机房节点
+    split = settings["purity_split"]
+    home_nodes: List[str] = []
+    dc_nodes: List[str] = []
+    for r in results:
+        if r.get("should_filter"):
+            continue
+        score = r.get("risk_score")
+        if score is None or int(score) > split:
+            continue
+        if r.get("is_residential"):
+            home_nodes.append(r.get("out") or "")
+        elif r.get("is_datacenter"):
+            dc_nodes.append(r.get("out") or "")
+
+    with open(HOME_OUTPUT, "w", encoding="utf-8") as f:
+        for node in home_nodes:
             f.write(node + "\n")
-    print(f"\n✅ 节点列表: {OUTPUT} ({len(final_nodes)} 条)")
+    print(f"🏠 原生家宽(纯净度<={split}%): {HOME_OUTPUT} ({len(home_nodes)} 条)")
+
+    with open(DC_OUTPUT, "w", encoding="utf-8") as f:
+        for node in dc_nodes:
+            f.write(node + "\n")
+    print(f"🏢 原生机房(纯净度<={split}%): {DC_OUTPUT} ({len(dc_nodes)} 条)")
+
+    # 反向删除 sources.txt 中纯净度高于 split 的节点行
+    if settings.get("reverse_delete_sources"):
+        removed = reverse_delete_from_sources(results, settings)
+        print(f"🗑  反向删除 sources.txt: {removed} 条高纯净度(>{split}%)节点已移除")
+    else:
+        print("🗑  反向删除已关闭 (reverse_delete_sources: false)")
 
     # 每次都重写，避免上一轮的陈旧内容留在文件里
     with open(RISKY_OUTPUT, "w", encoding="utf-8") as f:
