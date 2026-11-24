@@ -106,8 +106,12 @@ def main():
                 continue
 
             if not src.lower().startswith(("http://", "https://")):
-                # 非 HTTP 来源：伪协议订阅串或 base64 编码的订阅内容，按节点文本处理
-                ingest_text(chunks, src)
+                # 非 HTTP 来源：base64 编码的订阅内容，只收解码结果，不收原始串
+                decoded = decode_base64_block(src)
+                if decoded:
+                    chunks.extend(decoded)
+                else:
+                    print("  跳过无法识别的来源行")
                 continue
 
             print(f"抓取 URL: {src}")

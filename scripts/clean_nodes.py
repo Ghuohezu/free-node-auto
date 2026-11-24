@@ -71,6 +71,8 @@ SHARED_TABLE = [
 ]
 
 IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+# 主机名：字母数字连字符分段，且总长度不超过 253
+HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)+$")
 
 
 def purity_emoji(score) -> str:
@@ -122,9 +124,14 @@ def load_settings() -> Dict:
 
 
 def b64_text(text: str) -> str:
-    clean = text.strip().strip("=")
-    padded = clean + "=" * (-len(clean) % 4)
-    return base64.b64decode(padded, validate=False).decode("utf-8", errors="ignore")
+    # 订阅里常有被截断或混入 query 的 base64，这里做容错处理
+    clean = re.sub(r"[^A-Za-z0-9+/]", "", text.strip()).rstrip("=")
+    clean = clean[: len(clean) - (len(clean) % 4)]
+    if not clean:
+        return ""
+    return base64.b64decode(clean + "=" * (-len(clean) % 4), validate=False).decode(
+        "utf-8", errors="ignore"
+    )
 
 
 class Node:
@@ -186,18 +193,28 @@ def _split_remark(body: str) -> Tuple[str, str]:
     return body, ""
 
 
+def _valid_host(host: str) -> bool:
+    if not host or len(host) > 253:
+        return False
+    return bool(IPV4_RE.fullmatch(host) or HOSTNAME_RE.fullmatch(host))
+
+
 def _split_host_port(body: str) -> Tuple[str, str]:
-    match = re.search(r"@([^:/?#\s]+)(?::(\d{2,6}))?", body)
+    auth = body.split("?", 1)[0].split("#", 1)[0]
+    # hysteria/hy2/tuic 等协议的分享串常常没有 userinfo，@ 必须可选
+    if "@" in auth:
+        auth = auth.rsplit("@", 1)[1]
+    match = re.search(r"(?:\[([^\]]+)\]|([^\]:/?#\s]+))(?::(\d{2,6}))?", auth)
     if not match:
         return "", ""
-    host = match.group(1).strip("[]")
-    return host, match.group(2) or ""
+    host = (match.group(1) or match.group(2) or "").strip()
+    return host, match.group(3) or ""
 
 
 def _parse_vmess(body: str, remark: str) -> Tuple[str, str, str]:
     try:
         data = json.loads(b64_text(body))
-        host = str(data.get("add") or "")
+        host = str(data.get("add") or data.get("host") or "")
         port = str(data.get("port") or "")
         if not remark:
             remark = str(data.get("ps") or "")
@@ -207,14 +224,19 @@ def _parse_vmess(body: str, remark: str) -> Tuple[str, str, str]:
 
 
 def _parse_ssr(body: str) -> Tuple[str, str]:
+    # base64 字母表不含冒号，因此用是否含冒号即可区分两种 SSR 格式
+    payload = body.split("#", 1)[0]
+    raw_parts = payload.split(":")
+    if len(raw_parts) >= 2:
+        return raw_parts[0].strip("[]"), raw_parts[1]
     try:
-        payload = b64_text(body)
-        if "?" in payload:
-            payload = payload.split("?", 1)[0]
-        parts = payload.split(":")
-        return parts[0], parts[1]
+        decoded = b64_text(payload)
     except Exception:
         return "", ""
+    decoded_parts = decoded.split(":")
+    if len(decoded_parts) >= 2:
+        return decoded_parts[0].strip("[]"), decoded_parts[1]
+    return "", ""
 
 
 def _parse_ss(body: str) -> Tuple[str, str]:
@@ -261,7 +283,7 @@ def parse_node(line: str, protocols: List[str]) -> Optional[Node]:
     else:
         host, port = _split_host_port(body)
 
-    if not host:
+    if not host or not _valid_host(host):
         return None
     return Node(line, protocol, remark, host, port)
 
@@ -545,15 +567,16 @@ class NodeProcessor:
             return None, record
 
         risk_level = "CLEAN"
-        if is_vpn and self.settings["filter_vpn"]:
+        if is_vpn:
             risk_level = "RISKY"
-            record["should_filter"] = True
             record["filter_reason"] = "VPN 节点"
-        elif (risk_score is not None and risk_score > self.settings["risk_threshold"]
-              and self.settings["filter_risky"]):
+            if self.settings["filter_vpn"]:
+                record["should_filter"] = True
+        elif (risk_score is not None and risk_score > self.settings["risk_threshold"]):
             risk_level = "RISKY"
-            record["should_filter"] = True
             record["filter_reason"] = f"风险分数过高 ({int(risk_score)}%)"
+            if self.settings["filter_risky"]:
+                record["should_filter"] = True
         record["risk_level"] = risk_level
 
         return self.apply_label(node, label), record
