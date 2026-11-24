@@ -24,11 +24,6 @@ except Exception:
 INPUT = "output/raw_nodes.txt"
 HOME_OUTPUT = "output/home_nodes.txt"
 DC_OUTPUT = "output/datacenter_nodes.txt"
-RISKY_OUTPUT = "output/risky_nodes.txt"
-FILTERED_LOG = "output/filtered_nodes.log"
-DEAD_LOG = "output/dead_nodes.log"
-RESULT_JSON = "output/result.json"
-HTML_REPORT = "output/report.html"
 SETTINGS_FILE = "config/settings.yaml"
 
 DEFAULT_SETTINGS = {
@@ -756,50 +751,6 @@ def extract_node_lines(text: str) -> List[str]:
     return lines
 
 
-def generate_html_report(results: List[Dict], stats: Dict) -> str:
-    html = [
-        "<!doctype html>",
-        '<html><head><meta charset="utf-8"><title>节点清洗报告</title>',
-        "<style>",
-        "body{font-family:-apple-system,Segoe UI,Microsoft YaHei,sans-serif;margin:24px;color:#222}",
-        "h1{font-size:20px}h2{font-size:16px;margin-top:28px}",
-        "table{border-collapse:collapse;width:100%;font-size:13px}",
-        "th,td{border:1px solid #ddd;padding:6px 8px;text-align:left}",
-        "th{background:#f5f5f5}tr:nth-child(even){background:#fafafa}",
-        ".kpi{display:inline-block;margin-right:24px}",
-        ".kpi b{font-size:20px;display:block}",
-        "</style></head><body>",
-        "<h1>节点清洗报告</h1>",
-        f'<div class="kpi">总节点<b>{stats.get("total", 0)}</b></div>',
-        f'<div class="kpi">IP 直连<b>{stats.get("ip_only", 0)}</b></div>',
-        f'<div class="kpi">域名解析<b>{stats.get("domain_only", 0)}</b></div>',
-        f'<div class="kpi">正常<b>{stats.get("clean", 0)}</b></div>',
-        f'<div class="kpi">风险<b>{stats.get("risky", 0)}</b></div>',
-        f'<div class="kpi">已过滤<b>{stats.get("filtered", 0)}</b></div>',
-        '<table><tr><th>节点名</th><th>协议</th><th>服务器</th><th>解析 IP</th><th>纯净度</th>'
-        '<th>风险分</th><th>带宽类型</th><th>IP 来源</th><th>共享人数</th><th>国家</th><th>数据源</th></tr>',
-    ]
-    for r in results[:1000]:
-        shared = r.get("shared_users")
-        html.append(
-            "<tr>"
-            f"<td>{r.get('remark', '')}</td>"
-            f"<td>{r.get('protocol', '')}</td>"
-            f"<td>{r.get('host', '')}{':' + r.get('port', '') if r.get('port') else ''}</td>"
-            f"<td>{r.get('ip', '')}</td>"
-            f"<td>{r.get('emoji', '')}</td>"
-            f"<td>{'' if r.get('fraud_score') is None else r.get('fraud_score')}</td>"
-            f"<td>{r.get('attr', '')}</td>"
-            f"<td>{r.get('ip_src', '')}</td>"
-            f"<td>{'' if shared is None else shared}</td>"
-            f"<td>{r.get('country', '')}</td>"
-            f"<td>{r.get('source', '')}</td>"
-            "</tr>"
-        )
-    html.append("</table></body></html>")
-    return "\n".join(html)
-
-
 def read_raw_nodes(path: str) -> List[str]:
     with open(path, encoding="utf-8") as f:
         return f.read()
@@ -889,7 +840,7 @@ async def main():
         print("⚠️ 未找到任何节点，请检查输入文件")
         return
 
-    dead_records: List[Tuple[str, str]] = []
+    dead_count = 0
     if settings.get("probe_reachability"):
         print("🛰 正在探测节点可达性...", flush=True)
         prober = ReachabilityProber(settings)
@@ -905,12 +856,12 @@ async def main():
 
         await asyncio.gather(*[_probe_one(n) for n in nodes])
         nodes = alive
-        dead_records = [(node.raw, note) for node, note in dead]
-        print(f"  🚫 不可达节点: {len(dead_records)}", flush=True)
+        dead_count = len(dead)
+        print(f"  🚫 不可达节点: {dead_count}", flush=True)
 
     processor = NodeProcessor(settings)
-    processor.stats["dead"] = len(dead_records)
-    final_nodes, results, risky_nodes = await processor.process(nodes)
+    processor.stats["dead"] = dead_count
+    final_nodes, results, _risky_nodes = await processor.process(nodes)
 
     print("\n" + "=" * 70)
     print("📊 处理统计:")
@@ -958,41 +909,6 @@ async def main():
         print(f"🗑  反向删除 sources.txt: {removed} 条高纯净度(>{split}%)节点已移除")
     else:
         print("🗑  反向删除已关闭 (reverse_delete_sources: false)")
-
-    # 每次都重写，避免上一轮的陈旧内容留在文件里
-    with open(RISKY_OUTPUT, "w", encoding="utf-8") as f:
-        for node in risky_nodes:
-            f.write(node + "\n")
-    print(f"📋 风险节点: {RISKY_OUTPUT} ({len(risky_nodes)} 条)")
-
-    with open(DEAD_LOG, "w", encoding="utf-8") as f:
-        f.write("不可达节点日志\n")
-        f.write("=" * 70 + "\n\n")
-        for raw, note in dead_records:
-            f.write(f"[{note}] {raw}\n")
-    print(f"📋 不可达节点: {DEAD_LOG} ({len(dead_records)} 条)")
-
-    with open(RESULT_JSON, "w", encoding="utf-8") as f:
-        json.dump({"stats": processor.stats, "settings": settings, "results": results},
-                  f, ensure_ascii=False, indent=2)
-    print(f"📋 JSON 结果: {RESULT_JSON}")
-
-    with open(HTML_REPORT, "w", encoding="utf-8") as f:
-        f.write(generate_html_report(results, processor.stats))
-    print(f"📊 HTML 报告: {HTML_REPORT}")
-
-    if processor.filtered_log or processor.risky_log:
-        with open(FILTERED_LOG, "w", encoding="utf-8") as f:
-            f.write("过滤日志\n")
-            f.write("=" * 70 + "\n\n")
-            for log in processor.filtered_log:
-                f.write(log + "\n")
-            if processor.risky_log:
-                f.write("\n" + "=" * 70 + "\n\n")
-                f.write("风险保留记录\n\n")
-                for log in processor.risky_log:
-                    f.write(log + "\n")
-        print(f"📋 过滤日志: {FILTERED_LOG}")
 
     print("=" * 70)
     print("✨ 所有任务完成！")

@@ -1,6 +1,9 @@
 # IP 检测结果缓存，由清洗脚本自动维护
 output/ip_cache.json
 
+# 抓取中间产物，由 fetch 脚本自动维护（仅作为流水线工作文件，不入库）
+output/raw_nodes.txt
+
 # Python
 __pycache__/
 *.py[cod]
