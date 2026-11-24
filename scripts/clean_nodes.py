@@ -839,6 +839,7 @@ class NodeProcessor:
             timeout=aiohttp.ClientTimeout(total=self.settings["request_timeout"]),
             connector=connector,
             headers=headers,
+            trust_env=True,
         ) as session:
             async def worker(node: Node):
                 async with sem:
