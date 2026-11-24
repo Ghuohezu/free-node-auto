@@ -4,6 +4,7 @@ import json
 import os
 import re
 import socket
+import ssl
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional, Tuple
 
@@ -24,6 +25,7 @@ INPUT = "output/raw_nodes.txt"
 OUTPUT = "output/nodes.txt"
 RISKY_OUTPUT = "output/risky_nodes.txt"
 FILTERED_LOG = "output/filtered_nodes.log"
+DEAD_LOG = "output/dead_nodes.log"
 RESULT_JSON = "output/result.json"
 HTML_REPORT = "output/report.html"
 SETTINGS_FILE = "config/settings.yaml"
@@ -43,13 +45,16 @@ DEFAULT_SETTINGS = {
         "anytls://", "hysteria://", "hysteria2://", "hy2://", "hy://",
         "tuic://"
     ],
-    "concurrency": 16,
+        "concurrency": 16,
     "request_timeout": 8,
     "dns_timeout": 5,
     "rate": {
         "ippure": 25,
         "ipapi": 40,
     },
+    "probe_reachability": True,
+    "probe_timeout": 5,
+    "probe_tls": True,
     "user_agent": "Mozilla/5.0 (X11; Linux x86_64) node-cleaner/2.0",
 }
 
@@ -660,6 +665,78 @@ class NodeProcessor:
         return final_nodes, self.results, risky_nodes
 
 
+QUIC_PROTOCOLS = ("tuic://", "hysteria://", "hysteria2://", "hy2://", "hy://")
+
+
+def _protocol_uses_tls(node) -> bool:
+    """判断该节点是否用 TLS 承载（这类节点做 TCP 探测后还需 TLS 握手确认）"""
+    p = node.protocol
+    if p == "trojan://":
+        return True
+    if p == "vless://":
+        q = node.raw.split("?", 1)[1] if "?" in node.raw else ""
+        return bool(re.search(r"security=(?:tls|xtls)", q))
+    if p in ("ss://", "ssr://"):
+        q = node.raw.split("?", 1)[1] if "?" in node.raw else ""
+        return "tls" in q
+    return False
+
+
+class ReachabilityProber:
+    """清洗前的可达性预过滤。
+
+    - TCP 协议：TCP 连接失败即判死
+    - TLS 协议（vless-tls / trojan / ss-tls）：TCP 通但 TLS 握手失败判死
+    - QUIC 协议（tuic / hysteria* / hy2 / hy）：只做 TCP 探测，失败不判死，
+      因为 QUIC 服务器可能不监听 TCP，避免误杀
+    """
+
+    def __init__(self, settings: Dict):
+        self.timeout = max(1, settings.get("probe_timeout", 5))
+        self.do_tls = settings.get("probe_tls", True)
+        self.sem = asyncio.Semaphore(max(1, settings.get("concurrency", 16)))
+
+    async def _tcp(self, host: str, port) -> None:
+        r, w = await asyncio.wait_for(
+            asyncio.open_connection(host, int(port)), self.timeout
+        )
+        w.close()
+        try:
+            await w.wait_closed()
+        except Exception:
+            pass
+
+    async def _tls(self, host: str, port) -> None:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        r, w = await asyncio.wait_for(
+            asyncio.open_connection(host, int(port), ssl=ctx, server_hostname=host),
+            self.timeout,
+        )
+        w.close()
+        try:
+            await w.wait_closed()
+        except Exception:
+            pass
+
+    async def probe(self, node) -> Tuple[bool, str]:
+        async with self.sem:
+            host, port = node.host, node.port
+            try:
+                await self._tcp(host, port)
+            except Exception:
+                if node.protocol in QUIC_PROTOCOLS:
+                    return True, "QUIC 未验证"
+                return False, "TCP 不通"
+            if self.do_tls and _protocol_uses_tls(node):
+                try:
+                    await self._tls(host, port)
+                except Exception:
+                    return False, "TLS 握手失败"
+            return True, "可达"
+
+
 def extract_node_lines(text: str) -> List[str]:
     lines: List[str] = []
     for line in text.splitlines():
@@ -755,13 +832,34 @@ async def main():
         print("⚠️ 未找到任何节点，请检查输入文件")
         return
 
+    dead_records: List[Tuple[str, str]] = []
+    if settings.get("probe_reachability"):
+        print("🛰 正在探测节点可达性...", flush=True)
+        prober = ReachabilityProber(settings)
+        alive: List[Node] = []
+        dead: List[Tuple[Node, str]] = []
+
+        async def _probe_one(node: Node) -> None:
+            ok, note = await prober.probe(node)
+            if ok:
+                alive.append(node)
+            else:
+                dead.append((node, note))
+
+        await asyncio.gather(*[_probe_one(n) for n in nodes])
+        nodes = alive
+        dead_records = [(node.raw, note) for node, note in dead]
+        print(f"  🚫 不可达节点: {len(dead_records)}", flush=True)
+
     processor = NodeProcessor(settings)
+    processor.stats["dead"] = len(dead_records)
     final_nodes, results, risky_nodes = await processor.process(nodes)
 
     print("\n" + "=" * 70)
     print("📊 处理统计:")
     print("=" * 70)
     print(f"✅ 总节点数:   {processor.stats['total']}")
+    print(f"🛰  不可达:     {processor.stats.get('dead', 0)}")
     print(f"🌐 IP 直连:     {processor.stats['ip_only']}")
     print(f"📍 域名解析:    {processor.stats['domain_only']}")
     print(f"✓ 正常节点:     {processor.stats['clean']}")
@@ -782,6 +880,13 @@ async def main():
         for node in risky_nodes:
             f.write(node + "\n")
     print(f"📋 风险节点: {RISKY_OUTPUT} ({len(risky_nodes)} 条)")
+
+    with open(DEAD_LOG, "w", encoding="utf-8") as f:
+        f.write("不可达节点日志\n")
+        f.write("=" * 70 + "\n\n")
+        for raw, note in dead_records:
+            f.write(f"[{note}] {raw}\n")
+    print(f"📋 不可达节点: {DEAD_LOG} ({len(dead_records)} 条)")
 
     with open(RESULT_JSON, "w", encoding="utf-8") as f:
         json.dump({"stats": processor.stats, "settings": settings, "results": results},

@@ -61,4 +61,17 @@ rate:
   ippure: 25
   ipapi: 40
 
+# --- 可达性预过滤 ---
+# 是否在清洗前探测节点可达性，剔除服务器端口不通的节点
+# true  = 只输出活节点，死节点写入 output/dead_nodes.log
+# false = 关闭探测，与 clash-ip-checker 一致（只做 IP 风险判定）
+probe_reachability: true
+
+# 单个节点探测超时（秒）
+probe_timeout: 5
+
+# 是否对 TLS 承载的节点（vless-tls / trojan / ss-tls）做 TLS 握手确认
+# TLS 握手失败会判为不可达并剔除
+probe_tls: true
+
 user_agent: "Mozilla/5.0 (X11; Linux x86_64) node-cleaner/2.0"

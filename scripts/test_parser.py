@@ -119,6 +119,24 @@ async def test_risk_levels():
               len(risky) == (0 if expect_filtered else 1), f"len={len(risky)}")
 
 
+def test_probe_classification():
+    """可达性探测的协议分类：TLS 承载判定与 QUIC 名单"""
+    s = cn.load_settings()
+    cases = [
+        ("vless tls", "vless://uuid@1.2.3.4:443?security=tls#A", True),
+        ("vless reality", "vless://uuid@1.2.3.4:443?security=reality&pbk=x#B", False),
+        ("vless none", "vless://uuid@1.2.3.4:443?type=tcp#C", False),
+        ("trojan", "trojan://pw@1.2.3.4:443#D", True),
+        ("ss 无tls", "ss://YWVz@1.2.3.4:8388#E", False),
+        ("ssr", "ssr://1.2.3.4:8388:o:a:m:au#F", False),
+    ]
+    for name, line, expect in cases:
+        n = cn.parse_node(line, s["protocols"])
+        check(f"probe_tls {name}", bool(n) and cn._protocol_uses_tls(n) == expect)
+    for p in ("tuic://", "hysteria2://", "hy2://", "hy://", "hysteria://"):
+        check(f"QUIC {p}", p in cn.QUIC_PROTOCOLS)
+
+
 def main():
     print("=" * 70)
     print("离线回归测试")
@@ -130,6 +148,7 @@ def main():
     test_truncated_base64()
     test_host_validation()
     asyncio.run(test_risk_levels())
+    test_probe_classification()
 
     print()
     print(f"通过 {len(PASSED)} / 失败 {len(FAILED)}")
