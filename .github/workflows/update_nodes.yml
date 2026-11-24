@@ -34,6 +34,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Run regression tests
+        run: |
+          python scripts/test_parser.py
+
       - name: Fetch Nodes
         run: |
           echo "开始抓取节点"
@@ -56,6 +60,11 @@ jobs:
           echo ""
           echo "清洗结果示例"
           head -n 5 output/nodes.txt
+          echo ""
+          # 清洗产物为空直接判失败，避免把空订阅提交回仓库
+          count=$(wc -l < output/nodes.txt)
+          echo "校验节点数量: $count"
+          test "$count" -gt 0
 
       - name: Sync repository
         run: |

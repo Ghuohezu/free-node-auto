@@ -8,11 +8,16 @@
 risk_threshold: 75
 
 # 是否把判定为高风险的节点从输出中剔除
-# true  = 剔除，并单独写入 output/risky_nodes.txt
-# false = 全部保留，仅在节点名前打标签（与 clash-ip-checker 一致）
+# true  = 剔除，明细写入 output/filtered_nodes.log
+# false = 全部保留并打标签，同时单独写入 output/risky_nodes.txt
+# 注意：只有 filter_risky=false 时才会生成 output/risky_nodes.txt
 filter_risky: true
 
 # 是否过滤被标记为 VPN 的 IP
+# 注意：ip-api.com 判定的 VPN IP 与高风险 IP 高度重合，
+# 只要 filter_vpn=true，这些节点会被当作 VPN 直接剔除，
+# 不会进入上面的风险保留分支（filter_risky 的 false 分支也就走不到）。
+# 想让高风险节点进 output/risky_nodes.txt，需要同时把 filter_vpn 设为 false。
 filter_vpn: true
 
 # 是否启用 IP 黑名单过滤

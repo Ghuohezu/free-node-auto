@@ -126,7 +126,9 @@ def load_settings() -> Dict:
 def b64_text(text: str) -> str:
     # 订阅里常有被截断或混入 query 的 base64，这里做容错处理
     clean = re.sub(r"[^A-Za-z0-9+/]", "", text.strip()).rstrip("=")
-    clean = clean[: len(clean) - (len(clean) % 4)]
+    if len(clean) % 4 == 1:
+        # 末尾单个字符无法构成有效分组，丢弃它
+        clean = clean[: len(clean) - 1]
     if not clean:
         return ""
     return base64.b64decode(clean + "=" * (-len(clean) % 4), validate=False).decode(
@@ -563,6 +565,7 @@ class NodeProcessor:
 
         if self.settings["filter_blacklist"] and ip in set(self.settings["blacklist_ips"]):
             record["should_filter"] = True
+            record["risk_level"] = "UNKNOWN"
             record["filter_reason"] = "IP 黑名单"
             return None, record
 
@@ -774,11 +777,11 @@ async def main():
             f.write(node + "\n")
     print(f"\n✅ 节点列表: {OUTPUT} ({len(final_nodes)} 条)")
 
-    if risky_nodes:
-        with open(RISKY_OUTPUT, "w", encoding="utf-8") as f:
-            for node in risky_nodes:
-                f.write(node + "\n")
-        print(f"📋 风险节点: {RISKY_OUTPUT} ({len(risky_nodes)} 条)")
+    # 每次都重写，避免上一轮的陈旧内容留在文件里
+    with open(RISKY_OUTPUT, "w", encoding="utf-8") as f:
+        for node in risky_nodes:
+            f.write(node + "\n")
+    print(f"📋 风险节点: {RISKY_OUTPUT} ({len(risky_nodes)} 条)")
 
     with open(RESULT_JSON, "w", encoding="utf-8") as f:
         json.dump({"stats": processor.stats, "settings": settings, "results": results},
