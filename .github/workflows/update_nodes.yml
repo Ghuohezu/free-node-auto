@@ -85,5 +85,6 @@ jobs:
           file_pattern: |
             output/*
             config/sources.txt
+            config/Node file
           skip_checkout: true
           create_parent_directories: true

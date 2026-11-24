@@ -5,7 +5,15 @@ from urllib.parse import unquote
 
 import requests
 
+from clean_nodes import clash_proxy_to_uri
+
+try:
+    import yaml
+except Exception:
+    yaml = None
+
 SOURCES = "config/sources.txt"
+NODE_FILE = "config/Node file"
 OUTPUT = "output/raw_nodes.txt"
 
 HEADERS = {
@@ -86,6 +94,38 @@ def ingest_text(chunks, text):
     chunks.extend(decode_base64_block(text))
 
 
+def read_node_file(path: str):
+    """读取 Clash YAML 的 proxies，并转换为现有清洗器支持的分享链接。"""
+    if not os.path.exists(path):
+        return []
+    if yaml is None:
+        print(f"缺少 pyyaml，跳过 Clash 节点文件: {path}")
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        proxies = data.get("proxies", [])
+        if not isinstance(proxies, list):
+            raise ValueError("proxies 不是列表")
+    except Exception as e:
+        print(f"读取 Clash 节点文件失败: {e}")
+        return []
+
+    nodes = []
+    unsupported = 0
+    for proxy in proxies:
+        try:
+            raw = clash_proxy_to_uri(proxy)
+        except Exception:
+            raw = ""
+        if raw:
+            nodes.append(raw)
+        else:
+            unsupported += 1
+    print(f"读取 Clash 节点文件: {path} ({len(nodes)} 条，跳过 {unsupported} 条)")
+    return nodes
+
+
 def main():
     os.makedirs("output", exist_ok=True)
 
@@ -125,6 +165,8 @@ def main():
 
         except Exception as e:
             print(f"  失败: {e}")
+
+    chunks.extend(read_node_file(NODE_FILE))
 
     nodes = []
     seen = set()

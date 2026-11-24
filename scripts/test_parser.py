@@ -206,6 +206,126 @@ def test_rebuild_sources():
     return tmpdir
 
 
+def test_clash_yaml_conversion():
+    """Node file 中的五类 Clash 节点必须能进入原有 URI 清洗流程。"""
+    proxies = [
+        {"name": "旧美国", "type": "ss", "server": "1.2.3.4", "port": 8388,
+         "cipher": "aes-256-gcm", "password": "pw", "plugin": "v2ray-plugin",
+         "plugin-opts": {"mode": "websocket", "host": "example.com", "path": "/ws"}},
+        {"name": "旧日本", "type": "vless", "server": "2.3.4.5", "port": 443,
+         "uuid": "11111111-1111-1111-1111-111111111111", "tls": True,
+         "servername": "example.com", "network": "ws",
+         "ws-opts": {"path": "/ws", "headers": {"Host": "example.com"}}},
+        {"name": "旧香港", "type": "trojan", "server": "3.4.5.6", "port": 443,
+         "password": "pw", "sni": "example.com"},
+        {"name": "旧新加坡", "type": "hysteria2", "server": "4.5.6.7", "port": 443,
+         "password": "pw", "sni": "example.com", "obfs": "salamander",
+         "obfs-password": "secret"},
+        {"name": "旧台湾", "type": "anytls", "server": "5.6.7.8", "port": 443,
+         "password": "pw", "sni": "example.com"},
+    ]
+    for proxy in proxies:
+        raw = cn.clash_proxy_to_uri(proxy)
+        node = cn.parse_node(raw, cn.DEFAULT_SETTINGS["protocols"])
+        check(f"Clash 转换 {proxy['type']}", bool(
+            node and node.host == proxy["server"] and node.port == str(proxy["port"])
+        ), raw)
+
+
+def test_cross_validation():
+    """属性一致才通过，备用源不再凭空提供原生结论。"""
+    ippure = {
+        "source": "ippure", "risk_score": 10, "is_residential": True,
+        "is_datacenter": False, "is_broadcast": False, "is_vpn": False,
+        "country": "United States", "country_code": "US", "shared_users": 5,
+    }
+    ipapi = {
+        "source": "ipapi", "risk_score": 10, "is_residential": True,
+        "is_datacenter": False, "is_broadcast": None, "is_vpn": False,
+        "country": "美国", "country_code": "US", "shared_users": None,
+    }
+    merged = cn.merge_ip_results([ippure, ipapi])
+    check("双源住宅一致", merged["type_verified"] and merged["is_residential"])
+    check("中文地区优先", merged["country"] == "美国")
+    check("明确非广播才原生", merged["is_broadcast"] is False)
+    check("风险分取保守值", merged["risk_score"] == 10)
+
+    conflict = dict(ipapi, is_residential=False, is_datacenter=True)
+    merged_conflict = cn.merge_ip_results([ippure, conflict])
+    check("住宅/机房冲突拒绝", merged_conflict["classification_conflict"]
+          and not merged_conflict["type_verified"])
+    wrong_country = dict(ipapi, country="日本", country_code="JP")
+    check("国家冲突识别", cn.merge_ip_results([ippure, wrong_country])["country_conflict"])
+    fallback = cn.merge_ip_results([ipapi])
+    check("ip-api 单源不冒充原生", fallback["is_broadcast"] is None
+          and not fallback["type_verified"])
+    check("字符串 false 正确解析", cn.as_bool("false", None) is False)
+
+
+def test_output_rename_and_node_file():
+    """输出按检测国家改名，Node file 只留下同样的合格 proxies。"""
+    import tempfile
+    import yaml
+
+    home_proxy = {"name": "旧日本", "type": "ss", "server": "1.2.3.4", "port": 8388,
+                  "cipher": "aes-256-gcm", "password": "pw"}
+    dc_proxy = {"name": "旧美国", "type": "trojan", "server": "2.3.4.5", "port": 443,
+                "password": "pw", "sni": "example.com"}
+    bad_proxy = {"name": "不合格", "type": "anytls", "server": "3.4.5.6", "port": 443,
+                 "password": "pw"}
+
+    def record(proxy, country, residential, score=10):
+        return {
+            "raw": cn.clash_proxy_to_uri(proxy), "risk_score": score,
+            "should_filter": score > 30, "type_verified": True,
+            "is_broadcast": False, "is_residential": residential,
+            "is_datacenter": not residential, "country": country,
+            "label": f"【🟢 {'住宅' if residential else '机房'}|原生】",
+        }
+
+    results = [
+        record(home_proxy, "美国", True),
+        record(dc_proxy, "日本", False),
+        record(bad_proxy, "香港", True, 95),
+    ]
+    home, dc = cn.build_outputs(results, 30)
+    check("住宅/机房输出保持分离", len(home) == 1 and len(dc) == 1)
+    check("旧地区名被检测地区替换", "美国 01" in home[0] and "旧日本" not in home[0]
+          and "日本 01" in dc[0] and "旧美国" not in dc[0])
+    check("高风险节点不输出", all("3.4.5.6" not in line for line in home + dc))
+
+    tmpdir = tempfile.mkdtemp()
+    path = os.path.join(tmpdir, "Node file")
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump({
+            "mixed-port": 7890,
+            "proxies": [home_proxy, dc_proxy, bad_proxy],
+            "proxy-groups": [{"name": "旧分组", "type": "select", "proxies": ["旧日本"]}],
+            "rules": ["MATCH,DIRECT"],
+        }, f, allow_unicode=True)
+    settings = cn.load_settings()
+    settings["node_file"] = path
+    stats = cn.rebuild_node_file(results, settings)
+    with open(path, encoding="utf-8") as f:
+        rewritten = yaml.safe_load(f)
+    check("Node file 严格回写统计", stats["kept"] == 2 and stats["removed"] == 1)
+    check("Node file 仅保留 proxies", list(rewritten) == ["proxies"])
+    check("Node file 删除不合格节点", len(rewritten["proxies"]) == 2
+          and all(p["server"] != "3.4.5.6" for p in rewritten["proxies"]))
+    check("Node file 名称同步检测地区",
+          [p["name"] for p in rewritten["proxies"]] == [r["display_name"] for r in results[:2]])
+
+    with open(path, encoding="utf-8") as f:
+        before_failed_check = f.read()
+    try:
+        cn.rebuild_node_file([dict(results[0], type_verified=False)], settings)
+        guard_raised = False
+    except RuntimeError:
+        guard_raised = True
+    with open(path, encoding="utf-8") as f:
+        check("双源全部失败时禁止误清空", guard_raised and f.read() == before_failed_check)
+
+
 def main():
     print("=" * 70)
     print("离线回归测试")
@@ -220,6 +340,9 @@ def main():
     test_probe_classification()
     test_purity_split()
     test_rebuild_sources()
+    test_clash_yaml_conversion()
+    test_cross_validation()
+    test_output_rename_and_node_file()
 
     print()
     print(f"通过 {len(PASSED)} / 失败 {len(FAILED)}")

@@ -7,6 +7,7 @@ import socket
 import ssl
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote, unquote, urlencode
 
 try:
     import yaml
@@ -25,6 +26,7 @@ INPUT = "output/raw_nodes.txt"
 HOME_OUTPUT = "output/home_nodes.txt"
 DC_OUTPUT = "output/datacenter_nodes.txt"
 SETTINGS_FILE = "config/settings.yaml"
+CACHE_VERSION = 2
 
 DEFAULT_SETTINGS = {
     "purity_split": 30,
@@ -34,6 +36,7 @@ DEFAULT_SETTINGS = {
     "filter_blacklist": True,
     "reverse_delete_sources": True,
     "sources_file": "config/sources.txt",
+    "node_file": "config/Node file",
     "sources": ["ippure", "ipapi"],
     "blacklist_ips": [
         "120.227.1.43",
@@ -101,6 +104,139 @@ def shared_emoji(count) -> str:
         if val <= upper:
             return emoji
     return "⚫"
+
+
+def as_bool(value, default=None):
+    """把 API/YAML 中常见的布尔表示统一为真正的 bool。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes", "y", "on"):
+            return True
+        if normalized in ("false", "0", "no", "n", "off"):
+            return False
+    return default
+
+
+def replace_remark(raw: str, remark: str) -> str:
+    body, _ = _split_remark(raw)
+    return f"{body}#{remark}"
+
+
+def clash_proxy_to_uri(proxy: Dict) -> str:
+    """将当前节点文件使用的 Clash 协议转换为标准分享链接。"""
+    if not isinstance(proxy, dict):
+        return ""
+    protocol = str(proxy.get("type", "")).lower()
+    server = str(proxy.get("server", "")).strip()
+    port = str(proxy.get("port", "")).strip()
+    if not server or not port:
+        return ""
+    host = f"[{server}]" if ":" in server and not server.startswith("[") else server
+    name = quote(str(proxy.get("name", "未命名")), safe="")
+
+    def common_params() -> Dict:
+        params = {}
+        sni = proxy.get("sni") or proxy.get("servername")
+        if sni:
+            params["sni"] = str(sni)
+        if proxy.get("client-fingerprint"):
+            params["fp"] = str(proxy["client-fingerprint"])
+        if as_bool(proxy.get("skip-cert-verify"), False):
+            params["allowInsecure"] = "1"
+        if proxy.get("alpn"):
+            alpn = proxy["alpn"]
+            params["alpn"] = ",".join(alpn) if isinstance(alpn, list) else str(alpn)
+        return params
+
+    def add_transport(params: Dict) -> None:
+        network = proxy.get("network")
+        if network:
+            params["type"] = str(network)
+        ws = proxy.get("ws-opts") or {}
+        if ws:
+            if ws.get("path"):
+                params["path"] = str(ws["path"])
+            headers = ws.get("headers") or {}
+            ws_host = headers.get("Host") or headers.get("host")
+            if ws_host:
+                params["host"] = str(ws_host)
+
+    if protocol == "ss":
+        cipher = str(proxy.get("cipher", ""))
+        password = str(proxy.get("password", ""))
+        userinfo = base64.urlsafe_b64encode(
+            f"{cipher}:{password}".encode()
+        ).decode().rstrip("=")
+        params = {}
+        plugin = proxy.get("plugin")
+        if plugin:
+            opts = proxy.get("plugin-opts") or {}
+            parts = [str(plugin)]
+            if plugin == "v2ray-plugin":
+                parts.append(f"mode={opts.get('mode', 'websocket')}")
+                for key in ("host", "path"):
+                    if opts.get(key):
+                        parts.append(f"{key}={opts[key]}")
+                if as_bool(opts.get("tls"), False):
+                    parts.append("tls")
+            elif plugin in ("obfs", "simple-obfs"):
+                for key in ("obfs", "obfs-host", "mode", "host"):
+                    if opts.get(key):
+                        parts.append(f"{key}={opts[key]}")
+            if opts.get("mux") is not None:
+                parts.append(f"mux={opts['mux']}")
+            params["plugin"] = ";".join(parts)
+        query = "?" + urlencode(params) if params else ""
+        return f"ss://{userinfo}@{host}:{port}{query}#{name}"
+
+    if protocol in ("vless", "trojan"):
+        params = common_params()
+        add_transport(params)
+        if protocol == "vless":
+            params["encryption"] = str(proxy.get("encryption", "none"))
+            reality = proxy.get("reality-opts") or {}
+            if reality:
+                params["security"] = "reality"
+                if reality.get("public-key"):
+                    params["pbk"] = str(reality["public-key"])
+                if reality.get("short-id"):
+                    params["sid"] = str(reality["short-id"])
+            elif as_bool(proxy.get("tls"), False):
+                params["security"] = "tls"
+            if proxy.get("flow"):
+                params["flow"] = str(proxy["flow"])
+            credential = str(proxy.get("uuid", ""))
+        else:
+            params["security"] = "tls"
+            credential = str(proxy.get("password", ""))
+        query = "?" + urlencode(params) if params else ""
+        return f"{protocol}://{quote(credential, safe='')}@{host}:{port}{query}#{name}"
+
+    if protocol in ("hysteria2", "hy2", "anytls"):
+        params = common_params()
+        if "allowInsecure" in params:
+            params["insecure"] = params.pop("allowInsecure")
+        if protocol in ("hysteria2", "hy2"):
+            for source_key, target_key in (
+                ("obfs", "obfs"), ("obfs-password", "obfs-password"),
+                ("up", "upmbps"), ("down", "downmbps"),
+            ):
+                if proxy.get(source_key) is not None:
+                    params[target_key] = str(proxy[source_key])
+            scheme = "hysteria2"
+        else:
+            scheme = "anytls"
+        credential = str(proxy.get("password") or proxy.get("auth") or "")
+        query = "?" + urlencode(params) if params else ""
+        return f"{scheme}://{quote(credential, safe='')}@{host}:{port}{query}#{name}"
+
+    return ""
 
 
 def load_settings() -> Dict:
@@ -246,6 +382,7 @@ def _parse_ssr(body: str) -> Tuple[str, str]:
 
 
 def _parse_ss(body: str) -> Tuple[str, str]:
+    body = body.split("?", 1)[0]
     if "@" in body and not body.startswith("ss://"):
         rest = body.split("@", 1)[1]
         host, _, port = rest.partition(":")
@@ -338,22 +475,23 @@ class IPPureSource(IPSource):
             return None
 
         ip_type = str(self._first(data, ["ipType", "ip_type", "type"], "")).lower()
-        is_resi = self._first(data, ["isResidential"], None)
+        is_resi = as_bool(self._first(data, ["isResidential"], None), None)
         if is_resi is None:
-            is_resi = ip_type in ("residential", "isp")
-        is_datacenter = self._first(data, ["isDatacenter"], None)
+            is_resi = True if ip_type in ("residential", "isp") else None
+        is_datacenter = as_bool(self._first(data, ["isDatacenter"], None), None)
         if is_datacenter is None:
-            is_datacenter = ip_type in ("datacenter", "idc")
+            is_datacenter = True if ip_type in ("datacenter", "idc") else None
 
         result = {
             "ip": self._first(data, ["ip"], ip),
-            "risk_score": int(score),
-            "is_residential": bool(is_resi),
-            "is_datacenter": bool(is_datacenter),
-            "is_broadcast": bool(self._first(data, ["isBroadcast"], False)),
-            "is_vpn": bool(self._first(data, ["isVpn", "isVPN"], False)),
+            "risk_score": int(float(score)),
+            "is_residential": is_resi,
+            "is_datacenter": is_datacenter,
+            "is_broadcast": as_bool(self._first(data, ["isBroadcast"], None), None),
+            "is_vpn": as_bool(self._first(data, ["isVpn", "isVPN"], None), False),
             "shared_users": None,
             "country": self._first(data, ["country", "countryName"], ""),
+            "country_code": str(self._first(data, ["countryCode", "country_code"], "")).upper(),
             "source": self.name,
         }
 
@@ -375,13 +513,16 @@ class IPPureSource(IPSource):
 class IPAPISource(IPSource):
     name = "ipapi"
     url = "http://ip-api.com/json"
-    fields = "status,country,city,isp,as,asname,proxy,hosting,query"
+    fields = "status,country,countryCode,regionName,city,isp,as,asname,proxy,hosting,query"
 
     async def check(self, session, ip: str) -> Optional[Dict]:
         async with self.limiter.acquire():
             pass
         try:
-            async with session.get(self.url + "/" + ip, params={"fields": self.fields}) as resp:
+            async with session.get(
+                self.url + "/" + ip,
+                params={"fields": self.fields, "lang": "zh-CN"},
+            ) as resp:
                 if resp.status != 200:
                     return None
                 data = await resp.json()
@@ -391,8 +532,8 @@ class IPAPISource(IPSource):
         if not isinstance(data, dict) or data.get("status") != "success":
             return None
 
-        hosting = bool(data.get("hosting"))
-        proxy = bool(data.get("proxy"))
+        hosting = as_bool(data.get("hosting"), False)
+        proxy = as_bool(data.get("proxy"), False)
         # 纯净度评分：普通住宅/家用 IP 最干净（10），普通机房 IP 稍高（20），
         # 被判为代理/VPN 的 IP 风险最高（95）。
         # 这样机房节点也能落进 purity_split(30) 以内的"绿/白"纯净桶。
@@ -402,10 +543,12 @@ class IPAPISource(IPSource):
             "risk_score": risk_score,
             "is_residential": not hosting,
             "is_datacenter": hosting,
-            "is_broadcast": False,
+            # ip-api 不提供原生/广播判定，未知时绝不能默认写成“原生”。
+            "is_broadcast": None,
             "is_vpn": proxy,
             "shared_users": None,
             "country": data.get("country", ""),
+            "country_code": str(data.get("countryCode", "")).upper(),
             "isp": data.get("isp", ""),
             "asname": data.get("asname", ""),
             "source": self.name,
@@ -416,6 +559,69 @@ SOURCES = {
     "ippure": IPPureSource,
     "ipapi": IPAPISource,
 }
+
+
+def merge_ip_results(results: List[Dict]) -> Optional[Dict]:
+    """合并所有数据源；住宅/机房必须双源一致，冲突时拒绝输出。"""
+    valid = [r for r in results if r]
+    if not valid:
+        return None
+
+    merged = dict(valid[0])
+
+    def ip_type(result: Dict) -> str:
+        residential = as_bool(result.get("is_residential"), None)
+        datacenter = as_bool(result.get("is_datacenter"), None)
+        if residential is True and datacenter is not True:
+            return "residential"
+        if datacenter is True and residential is not True:
+            return "datacenter"
+        return "unknown"
+
+    types = [ip_type(r) for r in valid]
+    known_types = {t for t in types if t != "unknown"}
+    merged["classification_conflict"] = len(known_types) > 1
+    merged["type_verified"] = (
+        len(valid) >= 2 and len(known_types) == 1
+        and all(t != "unknown" for t in types)
+    )
+    verified_type = next(iter(known_types)) if len(known_types) == 1 else ""
+    merged["is_residential"] = verified_type == "residential"
+    merged["is_datacenter"] = verified_type == "datacenter"
+
+    native_values = [
+        as_bool(r.get("is_broadcast"), None) for r in valid
+        if as_bool(r.get("is_broadcast"), None) is not None
+    ]
+    merged["native_conflict"] = len(set(native_values)) > 1
+    merged["is_broadcast"] = native_values[0] if native_values and not merged["native_conflict"] else None
+
+    scores = []
+    for result in valid:
+        try:
+            scores.append(int(float(result.get("risk_score"))))
+        except (TypeError, ValueError):
+            continue
+    merged["risk_score"] = max(scores) if scores else None
+    merged["is_vpn"] = any(as_bool(r.get("is_vpn"), False) for r in valid)
+    merged["shared_users"] = next(
+        (r.get("shared_users") for r in valid if r.get("shared_users") is not None), None
+    )
+
+    geo_source = next(
+        (r for r in valid if r.get("source") == "ipapi" and r.get("country")),
+        valid[0],
+    )
+    merged["country"] = str(geo_source.get("country") or "").strip()
+    merged["country_code"] = str(geo_source.get("country_code") or "").upper()
+    country_codes = {
+        str(r.get("country_code")).upper() for r in valid if r.get("country_code")
+    }
+    merged["country_conflict"] = len(country_codes) > 1
+    merged["source"] = "+".join(str(r.get("source", "unknown")) for r in valid)
+    merged["source_count"] = len(valid)
+    merged["cache_version"] = CACHE_VERSION
+    return merged
 
 
 class IPChecker:
@@ -438,7 +644,11 @@ class IPChecker:
                 with open(self.cache_file, encoding="utf-8") as fh:
                     data = json.load(fh)
                 if isinstance(data, dict):
-                    self.cache = {str(k): v for k, v in data.items()}
+                    # 旧缓存可能包含 ip-api 默认“原生”等错误结论，直接弃用。
+                    self.cache = {
+                        str(k): v for k, v in data.items()
+                        if isinstance(v, dict) and v.get("cache_version") == CACHE_VERSION
+                    }
         except Exception:
             self.cache = {}
 
@@ -453,16 +663,17 @@ class IPChecker:
     async def check(self, session, ip: str) -> Optional[Dict]:
         if ip in self.cache:
             return self.cache[ip]
-        result = None
+        results = []
         for source in self.sources:
             try:
                 result = await source.check(session, ip)
             except Exception:
                 result = None
             if result is not None:
-                break
-        self.cache[ip] = result
-        return result
+                results.append(result)
+        merged = merge_ip_results(results)
+        self.cache[ip] = merged
+        return merged
 
 
 class NodeProcessor:
@@ -554,7 +765,13 @@ class NodeProcessor:
             "is_vpn": is_vpn,
             "shared_users": info.get("shared_users") if info else None,
             "country": (info or {}).get("country", ""),
+            "country_code": (info or {}).get("country_code", ""),
             "source": (info or {}).get("source", ""),
+            "source_count": (info or {}).get("source_count", 0),
+            "type_verified": (info or {}).get("type_verified", False),
+            "classification_conflict": (info or {}).get("classification_conflict", False),
+            "country_conflict": (info or {}).get("country_conflict", False),
+            "native_conflict": (info or {}).get("native_conflict", False),
             "emoji": emoji,
             "attr": attr,
             "ip_src": src,
@@ -577,6 +794,20 @@ class NodeProcessor:
             record["should_filter"] = True
             record["risk_level"] = "UNKNOWN"
             record["filter_reason"] = "IP 黑名单"
+            return None, record
+
+        validation_reason = ""
+        if info:
+            if record["classification_conflict"]:
+                validation_reason = "住宅/机房属性在多数据源间冲突"
+            elif record["country_conflict"]:
+                validation_reason = "国家/地区在多数据源间冲突"
+            elif record["native_conflict"] or record["is_broadcast"] is True:
+                validation_reason = "非原生或原生属性冲突"
+        if validation_reason:
+            record["risk_level"] = "RISKY"
+            record["should_filter"] = True
+            record["filter_reason"] = validation_reason
             return None, record
 
         risk_level = "CLEAN"
@@ -827,6 +1058,78 @@ def rebuild_sources(results: List[Dict], settings: Dict) -> Dict:
     return {"clean": len(keep_clean), "unknown": len(keep_unknown), "removed": removed}
 
 
+def is_output_eligible(record: Dict, split: int) -> bool:
+    """只有双源一致、明确原生且地区可用的低风险节点才允许输出。"""
+    try:
+        clean = record.get("risk_score") is not None and int(record["risk_score"]) <= split
+    except (TypeError, ValueError):
+        clean = False
+    return bool(
+        clean
+        and not record.get("should_filter")
+        and record.get("type_verified")
+        and record.get("is_broadcast") is False
+        and (record.get("is_residential") or record.get("is_datacenter"))
+        and str(record.get("country") or "").strip()
+    )
+
+
+def build_outputs(results: List[Dict], split: int) -> Tuple[List[str], List[str]]:
+    """按真实检测地区重新命名，并用序号避免同地区节点重名。"""
+    home_nodes = []
+    dc_nodes = []
+    location_counts = {}
+    for record in results:
+        if not is_output_eligible(record, split):
+            continue
+        country = str(record["country"]).strip()
+        location_counts[country] = location_counts.get(country, 0) + 1
+        display_name = f"{record['label']} {country} {location_counts[country]:02d}"
+        record["display_name"] = display_name
+        record["out"] = replace_remark(record["raw"], display_name)
+        if record.get("is_residential"):
+            home_nodes.append(record["out"])
+        else:
+            dc_nodes.append(record["out"])
+    return home_nodes, dc_nodes
+
+
+def rebuild_node_file(results: List[Dict], settings: Dict) -> Dict:
+    """Node file 只保留可输出的合格 proxies，其余配置和节点全部删除。"""
+    path = settings.get("node_file", "config/Node file")
+    if not os.path.exists(path):
+        return {"total": 0, "kept": 0, "removed": 0}
+    if yaml is None:
+        raise RuntimeError("缺少 pyyaml，无法维护 Clash 节点文件")
+
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    proxies = data.get("proxies", [])
+    if not isinstance(proxies, list):
+        raise ValueError(f"{path} 中缺少有效的 proxies 列表")
+
+    if proxies and results and not any(r.get("type_verified") for r in results):
+        raise RuntimeError("本轮没有节点完成双源校验，为避免 API 故障误清空，拒绝回写 Node file")
+
+    result_by_raw = {r.get("raw"): r for r in results if r.get("raw")}
+    split = settings["purity_split"]
+    kept = []
+    seen = set()
+    for proxy in proxies:
+        raw = clash_proxy_to_uri(proxy)
+        record = result_by_raw.get(raw)
+        if not raw or raw in seen or not record or not is_output_eligible(record, split):
+            continue
+        seen.add(raw)
+        cleaned = dict(proxy)
+        cleaned["name"] = record["display_name"]
+        kept.append(cleaned)
+
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump({"proxies": kept}, f, allow_unicode=True, sort_keys=False)
+    return {"total": len(proxies), "kept": len(kept), "removed": len(proxies) - len(kept)}
+
+
 async def main():
     print("=" * 70)
     print("🚀 节点清洗脚本 (clash-ip-checker 风格标注版)")
@@ -901,20 +1204,9 @@ async def main():
 
     os.makedirs("output", exist_ok=True)
 
-    # 切分纯净度 <= purity_split 的家宽/机房节点
+    # 输出条件不变：风险分 <= split，分住宅/机房；另加双源、原生和地区校验。
     split = settings["purity_split"]
-    home_nodes: List[str] = []
-    dc_nodes: List[str] = []
-    for r in results:
-        if r.get("should_filter"):
-            continue
-        score = r.get("risk_score")
-        if score is None or int(score) > split:
-            continue
-        if r.get("is_residential"):
-            home_nodes.append(r.get("out") or "")
-        elif r.get("is_datacenter"):
-            dc_nodes.append(r.get("out") or "")
+    home_nodes, dc_nodes = build_outputs(results, split)
 
     with open(HOME_OUTPUT, "w", encoding="utf-8") as f:
         for node in home_nodes:
@@ -926,15 +1218,20 @@ async def main():
             f.write(node + "\n")
     print(f"🏢 原生机房(纯净度<={split}%): {DC_OUTPUT} ({len(dc_nodes)} 条)")
 
-    # 维护 sources.txt：删除 URL/base64/死节点/高纯净度节点，写回纯净与未知节点
+    # sources.txt 保持原策略；Node file 严格到“只保留本次可输出节点”。
     if settings.get("reverse_delete_sources"):
+        node_stats = rebuild_node_file(results, settings)
+        print(
+            f"🗑  维护 {settings.get('node_file', 'config/Node file')}: "
+            f"保留 {node_stats['kept']} / 删除 {node_stats['removed']}"
+        )
         stats = rebuild_sources(results, settings)
         print(
             f"🗑  维护 sources.txt: 删除 {stats['removed']} 条"
             f"（URL/base64 与死/脏节点），写回 纯净 {stats['clean']} / 未知 {stats['unknown']}"
         )
     else:
-        print("🗑  sources.txt 维护已关闭 (reverse_delete_sources: false)")
+        print("🗑  sources.txt 与 Node file 维护已关闭 (reverse_delete_sources: false)")
 
     print("=" * 70)
     print("✨ 所有任务完成！")

@@ -37,6 +37,8 @@ reverse_delete_sources: true
 
 # 被维护的源文件路径
 sources_file: config/sources.txt
+# 额外读取的 Clash YAML 节点文件；回写后只保留 proxies 中的合格节点
+node_file: config/Node file
 
 # 是否启用 IP 黑名单过滤
 filter_blacklist: true
@@ -46,9 +48,11 @@ blacklist_ips:
   - 120.227.1.43
   - 47.240.80.220
 
-# --- 检测数据源（按顺序尝试，前一个失败自动降级到下一个）---
+# --- 检测数据源（全部查询并交叉核验）---
 # ippure : api.ippure.net，返回风险分 + 宽带类型 + IP 来源 + 共享人数
-# ipapi  : ip-api.com，备用源，返回宽带类型（机房/住宅）
+# ipapi  : ip-api.com，提供宽带类型和中文国家/地区；不提供原生判定
+# 住宅/机房必须两个来源一致；国家冲突、属性冲突、广播 IP 不输出。
+# 只有 IPPure 明确返回“非广播”才会标为原生；备用源单独成功也不会冒充原生。
 sources:
   - ippure
   - ipapi
