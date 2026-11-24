@@ -5,7 +5,7 @@ name: Update Free Nodes
 
   workflow_dispatch:
 
-
+ 
   schedule:
 
     # 每6小时运行一次
