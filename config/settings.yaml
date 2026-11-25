@@ -49,8 +49,8 @@ blacklist_ips:
   - 47.240.80.220
 
 # --- 检测数据源（全部查询并交叉核验）---
-# ippure : api.ippure.net，返回风险分 + 宽带类型 + IP 来源 + 共享人数
-# ipapi  : ip-api.com，提供宽带类型和中文国家/地区；不提供原生判定
+# ippure : 通过 Chromium 读取 ippure.com 指定 IP 的结构化结果，返回风险分、宽带类型、IP 来源和国家代码
+# ipapi  : ip-api.com，提供宽带类型、VPN 标记和中文国家/地区；不提供原生判定
 # 住宅/机房必须两个来源一致；国家冲突、属性冲突、广播 IP 不输出。
 # 只有 IPPure 明确返回“非广播”才会标为原生；备用源单独成功也不会冒充原生。
 sources:

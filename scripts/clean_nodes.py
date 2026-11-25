@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -26,7 +27,7 @@ INPUT = "output/raw_nodes.txt"
 HOME_OUTPUT = "output/home_nodes.txt"
 DC_OUTPUT = "output/datacenter_nodes.txt"
 SETTINGS_FILE = "config/settings.yaml"
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 DEFAULT_SETTINGS = {
     "purity_split": 30,
@@ -338,7 +339,12 @@ def _split_remark(body: str) -> Tuple[str, str]:
 def _valid_host(host: str) -> bool:
     if not host or len(host) > 253:
         return False
-    return bool(IPV4_RE.fullmatch(host) or HOSTNAME_RE.fullmatch(host))
+    if IPV4_RE.fullmatch(host):
+        try:
+            return ipaddress.ip_address(host).is_global
+        except ValueError:
+            return False
+    return bool(HOSTNAME_RE.fullmatch(host))
 
 
 def _split_host_port(body: str) -> Tuple[str, str]:
@@ -448,66 +454,164 @@ class IPSource:
 
 
 class IPPureSource(IPSource):
+    """通过 IPPure 官网读取指定 IP；其数据接口需要页面动态签名。"""
+
     name = "ippure"
-    score_url = "https://api.ippure.net/v2/score"
-    shared_url = "https://api.ippure.net/v2/shared"
+    page_url = "https://ippure.com/"
+
+    def __init__(self, settings: Dict):
+        super().__init__(settings)
+        self._playwright = None
+        self._browser = None
+        self._browser_lock = asyncio.Lock()
+        self._page_semaphore = asyncio.Semaphore(
+            max(1, min(4, int(settings["concurrency"])))
+        )
 
     @staticmethod
-    def _first(data: Dict, keys: List[str], default=None):
-        for k in keys:
-            if k in data and data[k] is not None:
-                return data[k]
-        return default
+    def parse_payload(ip: str, basic: Dict, risk: Dict) -> Optional[Dict]:
+        if not all(isinstance(payload, dict) and payload.get("ok") is True
+                   for payload in (basic, risk)):
+            return None
+        basic_data = basic.get("data") or {}
+        risk_data = risk.get("data") or {}
+        if str(basic_data.get("ip", "")) != ip:
+            return None
 
-    async def check(self, session, ip: str) -> Optional[Dict]:
-        async with self.limiter.acquire():
-            pass
+        asn = basic_data.get("asn") or {}
+        traits = basic_data.get("traits") or {}
+        is_residential = as_bool(asn.get("is_residential"), None)
+        if is_residential is None:
+            ip_type = str(asn.get("type", "")).lower()
+            if ip_type in ("hosting", "datacenter", "idc"):
+                is_residential = False
+            elif ip_type in ("residential", "isp"):
+                is_residential = True
+        is_broadcast = as_bool(traits.get("is_broadcast"), None)
+        score = risk_data.get("risk_score")
+        if is_residential is None or is_broadcast is None or score is None:
+            return None
         try:
-            async with session.get(self.score_url, params={"ip": ip}) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json(content_type=None)
-        except Exception:
+            score = int(float(score))
+        except (TypeError, ValueError):
+            return None
+        if not 0 <= score <= 100:
             return None
 
-        score = self._first(data, ["riskScore", "fraudScore", "score"])
-        if score is None:
-            return None
+        geo = basic_data.get("geo") or {}
+        country_code = ""
+        for provider in ("IP2Location", "MaxMind", "DB-IP"):
+            location = geo.get(provider) or {}
+            if location.get("country_code"):
+                country_code = str(location["country_code"]).upper()
+                break
 
-        ip_type = str(self._first(data, ["ipType", "ip_type", "type"], "")).lower()
-        is_resi = as_bool(self._first(data, ["isResidential"], None), None)
-        if is_resi is None:
-            is_resi = True if ip_type in ("residential", "isp") else None
-        is_datacenter = as_bool(self._first(data, ["isDatacenter"], None), None)
-        if is_datacenter is None:
-            is_datacenter = True if ip_type in ("datacenter", "idc") else None
-
-        result = {
-            "ip": self._first(data, ["ip"], ip),
-            "risk_score": int(float(score)),
-            "is_residential": is_resi,
-            "is_datacenter": is_datacenter,
-            "is_broadcast": as_bool(self._first(data, ["isBroadcast"], None), None),
-            "is_vpn": as_bool(self._first(data, ["isVpn", "isVPN"], None), False),
+        return {
+            "ip": ip,
+            "risk_score": score,
+            "is_residential": is_residential,
+            "is_datacenter": not is_residential,
+            "is_broadcast": is_broadcast,
+            # 该接口不提供 VPN 结论，VPN 由 ip-api 交叉检查。
+            "is_vpn": None,
             "shared_users": None,
-            "country": self._first(data, ["country", "countryName"], ""),
-            "country_code": str(self._first(data, ["countryCode", "country_code"], "")).upper(),
-            "source": self.name,
+            "country": "",
+            "country_code": country_code,
+            "source": "ippure",
         }
 
-        try:
+    async def _get_browser(self):
+        async with self._browser_lock:
+            if self._browser is not None and self._browser.is_connected():
+                return self._browser
+            try:
+                from playwright.async_api import async_playwright
+            except ImportError as exc:
+                raise RuntimeError(
+                    "缺少 playwright，请执行 pip install -r requirements.txt "
+                    "并运行 python -m playwright install --with-deps chromium"
+                ) from exc
+
+            self._playwright = await async_playwright().start()
+            proxy = (
+                self.settings.get("browser_proxy")
+                or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+                or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+            )
+            try:
+                self._browser = await self._playwright.chromium.launch(
+                    headless=True,
+                    proxy={"server": proxy} if proxy else None,
+                )
+            except Exception:
+                await self._playwright.stop()
+                self._playwright = None
+                raise
+            return self._browser
+
+    async def check(self, session, ip: str) -> Optional[Dict]:
+        # 复用一个浏览器进程；每个 IP 使用独立页面，最多并发 4 页。
+        async with self._page_semaphore:
             async with self.limiter.acquire():
                 pass
-            async with session.get(self.shared_url, params={"ip": ip}) as resp:
-                if resp.status == 200:
-                    shared_data = await resp.json(content_type=None)
-                    users = self._first(shared_data, ["shared", "sharedUsers", "sharedCount"])
-                    if users is not None:
-                        result["shared_users"] = users
-        except Exception:
-            pass
+            page = None
+            try:
+                browser = await self._get_browser()
+                page = await browser.new_page()
+                timeout = max(30, int(self.settings["request_timeout"])) * 1000
+                basic_path = f"/api/info/ip-basic/{ip}"
+                risk_path = f"/api/info/ip-risk/{ip}"
 
-        return result
+                def is_signed_response(response, path: str) -> bool:
+                    return response.url.endswith(path) and bool(
+                        response.request.headers.get("x-t")
+                    )
+
+                async with page.expect_response(
+                    lambda response: is_signed_response(response, basic_path),
+                    timeout=timeout,
+                ) as basic_wait:
+                    async with page.expect_response(
+                        lambda response: is_signed_response(response, risk_path),
+                        timeout=timeout,
+                    ) as risk_wait:
+                        response = await page.goto(
+                            f"{self.page_url}?ip={ip}",
+                            wait_until="domcontentloaded",
+                            timeout=timeout,
+                        )
+                        if response is None or response.status != 200:
+                            return None
+                basic_response = await basic_wait.value
+                risk_response = await risk_wait.value
+                if basic_response.status != 200 or risk_response.status != 200:
+                    return None
+                basic = await basic_response.json()
+                risk = await risk_response.json()
+                return self.parse_payload(ip, basic, risk)
+            except Exception:
+                return None
+            finally:
+                if page is not None:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+
+    async def close(self):
+        async with self._page_semaphore:
+            if self._browser is not None:
+                try:
+                    await self._browser.close()
+                except Exception:
+                    pass
+                self._browser = None
+            if self._playwright is not None:
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    pass
+                self._playwright = None
 
 
 class IPAPISource(IPSource):
@@ -635,6 +739,7 @@ class IPChecker:
         if not self.sources:
             raise RuntimeError("没有可用的 IP 检测数据源，请检查 config/settings.yaml 的 sources")
         self.cache: Dict[str, Optional[Dict]] = {}
+        self._ip_locks: Dict[str, asyncio.Lock] = {}
         self.cache_file = settings.get("ip_cache_file", "output/ip_cache.json")
         self._load_disk_cache()
 
@@ -647,7 +752,9 @@ class IPChecker:
                     # 旧缓存可能包含 ip-api 默认“原生”等错误结论，直接弃用。
                     self.cache = {
                         str(k): v for k, v in data.items()
-                        if isinstance(v, dict) and v.get("cache_version") == CACHE_VERSION
+                        if isinstance(v, dict)
+                        and v.get("cache_version") == CACHE_VERSION
+                        and v.get("source_count") == len(self.sources)
                     }
         except Exception:
             self.cache = {}
@@ -663,17 +770,32 @@ class IPChecker:
     async def check(self, session, ip: str) -> Optional[Dict]:
         if ip in self.cache:
             return self.cache[ip]
-        results = []
+        lock = self._ip_locks.setdefault(ip, asyncio.Lock())
+        async with lock:
+            # 等待同 IP 的前一个任务完成后再查缓存，避免重复请求和结果覆盖。
+            if ip in self.cache:
+                return self.cache[ip]
+            results = []
+            for source in self.sources:
+                try:
+                    result = await source.check(session, ip)
+                except Exception:
+                    result = None
+                if result is not None:
+                    results.append(result)
+            merged = merge_ip_results(results)
+            # 只缓存本轮所有配置源均已返回的结果；单源临时失败必须在下轮重试。
+            if merged and merged.get("source_count") == len(self.sources):
+                self.cache[ip] = merged
+            else:
+                self.cache.pop(ip, None)
+            return merged
+
+    async def close(self):
         for source in self.sources:
-            try:
-                result = await source.check(session, ip)
-            except Exception:
-                result = None
-            if result is not None:
-                results.append(result)
-        merged = merge_ip_results(results)
-        self.cache[ip] = merged
-        return merged
+            close = getattr(source, "close", None)
+            if close is not None:
+                await close()
 
 
 class NodeProcessor:
@@ -845,7 +967,8 @@ class NodeProcessor:
                 async with sem:
                     return await self.process_one(node, session, loop)
 
-            for idx, node in enumerate(nodes, 1):
+            tasks = [asyncio.create_task(worker(node)) for node in nodes]
+            for idx, (node, task) in enumerate(zip(nodes, tasks), 1):
                 if idx % 25 == 0 or idx == len(nodes):
                     print(f"  处理中: {idx}/{len(nodes)}", end="\r", flush=True)
 
@@ -855,7 +978,7 @@ class NodeProcessor:
                     self.stats["domain_only"] += 1
 
                 try:
-                    labeled, record = await worker(node)
+                    labeled, record = await task
                 except Exception as e:
                     print(f"\n⚠️ 处理节点失败: {str(e)[:120]}")
                     record = {
@@ -897,6 +1020,9 @@ class NodeProcessor:
                     final_nodes.append(labeled)
 
         self.checker.save_disk_cache()
+        close_checker = getattr(self.checker, "close", None)
+        if close_checker is not None:
+            await close_checker()
 
         print("\n")
         return final_nodes, self.results, risky_nodes
@@ -1043,7 +1169,11 @@ def rebuild_sources(results: List[Dict], settings: Dict) -> Dict:
                     continue
                 node = parse_node(stripped, protocols)
                 if node is None:
-                    preamble.append(line)
+                    # 能识别协议头但主机/格式无效的是坏节点，不作为普通未知行保留。
+                    if low.startswith(tuple(p.lower() for p in protocols)):
+                        removed += 1
+                    else:
+                        preamble.append(line)
                     continue
                 if node.raw in keep_clean or node.raw in keep_unknown:
                     continue
