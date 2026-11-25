@@ -89,6 +89,9 @@ def test_host_validation():
     check("base64 主机名被拒绝", n is None)
     ok = cn.parse_node("vless://uuid@1.2.3.4:443?sni=x.com#Z", PROTOCOLS)
     check("正常节点不受影响", bool(ok and ok.host == "1.2.3.4"))
+    for invalid in ("0.0.0.0", "127.0.0.1", "192.168.1.1", "999.1.1.1"):
+        check(f"无效/非公网 IP 被拒绝 {invalid}", cn.parse_node(
+            f"ss://YWVz@{invalid}:8388#bad", PROTOCOLS) is None)
 
 
 async def test_risk_levels():
@@ -117,6 +120,40 @@ async def test_risk_levels():
               f"risk_level={rec['risk_level']} should_filter={rec['should_filter']}")
         check(f"risky_nodes 归集(filter_risky={flag})",
               len(risky) == (0 if expect_filtered else 1), f"len={len(risky)}")
+
+
+async def test_process_concurrency():
+    """节点任务应真正并发执行，同时保持结果顺序。"""
+    class StubChecker:
+        def __init__(self):
+            self.active = 0
+            self.max_active = 0
+
+        async def check(self, session, ip):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            await asyncio.sleep(0.02)
+            self.active -= 1
+            return {
+                "risk_score": 20, "is_vpn": False, "source": "stub",
+                "is_residential": False, "is_datacenter": True,
+                "is_broadcast": False, "shared_users": None, "country": "美国",
+                "country_code": "US", "type_verified": True, "source_count": 2,
+            }
+
+        def save_disk_cache(self):
+            pass
+
+    settings = cn.load_settings()
+    settings["concurrency"] = 4
+    processor = cn.NodeProcessor(settings)
+    checker = StubChecker()
+    processor.checker = checker
+    nodes = [cn.parse_node(f"vless://uuid@1.2.3.{i}:443#N{i}", PROTOCOLS)
+             for i in range(1, 5)]
+    _, results, _ = await processor.process(nodes)
+    check("节点检测真正并发", checker.max_active > 1, f"max_active={checker.max_active}")
+    check("并发处理保持输入顺序", [r["host"] for r in results] == [n.host for n in nodes])
 
 
 def test_probe_classification():
@@ -169,6 +206,7 @@ def test_rebuild_sources():
         "trojan://pw@3.3.3.3:443#dirty\n"
         "vless://22222222-2222-2222-2222-222222222222@4.4.4.4:443#unknown\n"
         "trojan://pw@5.5.5.5:443#dead\n"
+        "ss://YWVz@0.0.0.0:1#placeholder\n"
         "这不是节点行\n"
     )
     with open(sp, "w", encoding="utf-8") as f:
@@ -200,10 +238,207 @@ def test_rebuild_sources():
     check("rebuild 死节点删除", not any("5.5.5.5" in l for l in lines))
     check("rebuild 脏节点删除", not any("3.3.3.3" in l for l in lines))
     check("rebuild 注释保留", any(l.startswith("#") for l in lines))
+    check("rebuild 无效 IP 删除", not any("0.0.0.0" in l for l in lines))
     check("rebuild 未知行保留", any("这不是节点行" in l for l in lines))
     check("rebuild 统计", stats["clean"] == 3 and stats["unknown"] == 1
-          and stats["removed"] == 4, str(stats))
+          and stats["removed"] == 5, str(stats))
     return tmpdir
+
+
+def test_clash_yaml_conversion():
+    """Node file 中的五类 Clash 节点必须能进入原有 URI 清洗流程。"""
+    proxies = [
+        {"name": "旧美国", "type": "ss", "server": "1.2.3.4", "port": 8388,
+         "cipher": "aes-256-gcm", "password": "pw", "plugin": "v2ray-plugin",
+         "plugin-opts": {"mode": "websocket", "host": "example.com", "path": "/ws"}},
+        {"name": "旧日本", "type": "vless", "server": "2.3.4.5", "port": 443,
+         "uuid": "11111111-1111-1111-1111-111111111111", "tls": True,
+         "servername": "example.com", "network": "ws",
+         "ws-opts": {"path": "/ws", "headers": {"Host": "example.com"}}},
+        {"name": "旧香港", "type": "trojan", "server": "3.4.5.6", "port": 443,
+         "password": "pw", "sni": "example.com"},
+        {"name": "旧新加坡", "type": "hysteria2", "server": "4.5.6.7", "port": 443,
+         "password": "pw", "sni": "example.com", "obfs": "salamander",
+         "obfs-password": "secret"},
+        {"name": "旧台湾", "type": "anytls", "server": "5.6.7.8", "port": 443,
+         "password": "pw", "sni": "example.com"},
+    ]
+    for proxy in proxies:
+        raw = cn.clash_proxy_to_uri(proxy)
+        node = cn.parse_node(raw, cn.DEFAULT_SETTINGS["protocols"])
+        check(f"Clash 转换 {proxy['type']}", bool(
+            node and node.host == proxy["server"] and node.port == str(proxy["port"])
+        ), raw)
+
+
+def test_cross_validation():
+    """属性一致才通过，备用源不再凭空提供原生结论。"""
+    ippure = {
+        "source": "ippure", "risk_score": 10, "is_residential": True,
+        "is_datacenter": False, "is_broadcast": False, "is_vpn": False,
+        "country": "United States", "country_code": "US", "shared_users": 5,
+    }
+    ipapi = {
+        "source": "ipapi", "risk_score": 10, "is_residential": True,
+        "is_datacenter": False, "is_broadcast": None, "is_vpn": False,
+        "country": "美国", "country_code": "US", "shared_users": None,
+    }
+    merged = cn.merge_ip_results([ippure, ipapi])
+    check("双源住宅一致", merged["type_verified"] and merged["is_residential"])
+    check("中文地区优先", merged["country"] == "美国")
+    check("明确非广播才原生", merged["is_broadcast"] is False)
+    check("风险分取保守值", merged["risk_score"] == 10)
+
+    conflict = dict(ipapi, is_residential=False, is_datacenter=True)
+    merged_conflict = cn.merge_ip_results([ippure, conflict])
+    check("住宅/机房冲突拒绝", merged_conflict["classification_conflict"]
+          and not merged_conflict["type_verified"])
+    wrong_country = dict(ipapi, country="日本", country_code="JP")
+    check("国家冲突识别", cn.merge_ip_results([ippure, wrong_country])["country_conflict"])
+    fallback = cn.merge_ip_results([ipapi])
+    check("ip-api 单源不冒充原生", fallback["is_broadcast"] is None
+          and not fallback["type_verified"])
+    check("字符串 false 正确解析", cn.as_bool("false", None) is False)
+
+
+async def test_partial_source_cache():
+    """单源临时失败不能写入缓存，下一轮必须重新查询。"""
+    import tempfile
+    settings = cn.load_settings()
+    settings["ip_cache_file"] = os.path.join(tempfile.mkdtemp(), "cache.json")
+    checker = cn.IPChecker(settings)
+    payload = {
+        "source": "ipapi", "risk_score": 10, "is_residential": True,
+        "is_datacenter": False, "is_broadcast": None, "is_vpn": False,
+        "country": "美国", "country_code": "US", "shared_users": None,
+    }
+
+    class StubSource:
+        def __init__(self, result):
+            self.result = result
+            self.calls = 0
+
+        async def check(self, session, ip):
+            self.calls += 1
+            return self.result
+
+    available = StubSource(payload)
+    unavailable = StubSource(None)
+    checker.sources = [available, unavailable]
+    first = await checker.check(None, "1.2.3.4")
+    check("单源失败结果不写缓存", first["source_count"] == 1 and "1.2.3.4" not in checker.cache)
+    unavailable.result = dict(payload, source="ippure", is_broadcast=False)
+    second = await checker.check(None, "1.2.3.4")
+    check("数据源恢复后自动重试", available.calls == 2 and unavailable.calls == 2
+          and second["type_verified"] and checker.cache["1.2.3.4"]["source_count"] == 2)
+
+    checker.cache.clear()
+    available.calls = unavailable.calls = 0
+    original_check = available.check
+
+    async def slow_check(session, ip):
+        await asyncio.sleep(0.02)
+        return await original_check(session, ip)
+
+    available.check = slow_check
+    await asyncio.gather(*(checker.check(None, "1.2.3.4") for _ in range(5)))
+    check("同 IP 并发只查询一次", available.calls == 1 and unavailable.calls == 1,
+          f"calls={available.calls}/{unavailable.calls}")
+
+
+def test_ippure_payload():
+    """IPPure 结构化数据必须保留国家代码，并拒绝不完整或串 IP 的响应。"""
+    basic = {
+        "ok": True,
+        "data": {
+            "ip": "1.2.3.4",
+            "asn": {"is_residential": True, "type": "isp"},
+            "geo": {"IP2Location": {"country_code": "US"}},
+            "traits": {"is_broadcast": False},
+        },
+    }
+    risk = {"ok": True, "data": {"risk_score": 12}}
+    result = cn.IPPureSource.parse_payload("1.2.3.4", basic, risk)
+    check("IPPure 住宅原生解析", result["is_residential"] is True
+          and result["is_datacenter"] is False and result["is_broadcast"] is False)
+    check("IPPure 国家代码和风险分解析", result["country_code"] == "US"
+          and result["risk_score"] == 12)
+
+    hosting = dict(basic)
+    hosting["data"] = dict(basic["data"], asn={"type": "hosting"})
+    hosting_result = cn.IPPureSource.parse_payload("1.2.3.4", hosting, risk)
+    check("IPPure 机房类型回退解析", hosting_result["is_datacenter"] is True
+          and hosting_result["is_residential"] is False)
+    missing_native = dict(basic)
+    missing_native["data"] = dict(basic["data"], traits={})
+    check("IPPure 缺少原生属性时拒绝", cn.IPPureSource.parse_payload(
+        "1.2.3.4", missing_native, risk) is None)
+    check("IPPure 串 IP 响应时拒绝", cn.IPPureSource.parse_payload(
+        "5.6.7.8", basic, risk) is None)
+
+
+def test_output_rename_and_node_file():
+    """输出按检测国家改名，Node file 只留下同样的合格 proxies。"""
+    import tempfile
+    import yaml
+
+    home_proxy = {"name": "旧日本", "type": "ss", "server": "1.2.3.4", "port": 8388,
+                  "cipher": "aes-256-gcm", "password": "pw"}
+    dc_proxy = {"name": "旧美国", "type": "trojan", "server": "2.3.4.5", "port": 443,
+                "password": "pw", "sni": "example.com"}
+    bad_proxy = {"name": "不合格", "type": "anytls", "server": "3.4.5.6", "port": 443,
+                 "password": "pw"}
+
+    def record(proxy, country, residential, score=10):
+        return {
+            "raw": cn.clash_proxy_to_uri(proxy), "risk_score": score,
+            "should_filter": score > 30, "type_verified": True,
+            "is_broadcast": False, "is_residential": residential,
+            "is_datacenter": not residential, "country": country,
+            "label": f"【🟢 {'住宅' if residential else '机房'}|原生】",
+        }
+
+    results = [
+        record(home_proxy, "美国", True),
+        record(dc_proxy, "日本", False),
+        record(bad_proxy, "香港", True, 95),
+    ]
+    home, dc = cn.build_outputs(results, 30)
+    check("住宅/机房输出保持分离", len(home) == 1 and len(dc) == 1)
+    check("旧地区名被检测地区替换", "美国 01" in home[0] and "旧日本" not in home[0]
+          and "日本 01" in dc[0] and "旧美国" not in dc[0])
+    check("高风险节点不输出", all("3.4.5.6" not in line for line in home + dc))
+
+    tmpdir = tempfile.mkdtemp()
+    path = os.path.join(tmpdir, "Node file")
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump({
+            "mixed-port": 7890,
+            "proxies": [home_proxy, dc_proxy, bad_proxy],
+            "proxy-groups": [{"name": "旧分组", "type": "select", "proxies": ["旧日本"]}],
+            "rules": ["MATCH,DIRECT"],
+        }, f, allow_unicode=True)
+    settings = cn.load_settings()
+    settings["node_file"] = path
+    stats = cn.rebuild_node_file(results, settings)
+    with open(path, encoding="utf-8") as f:
+        rewritten = yaml.safe_load(f)
+    check("Node file 严格回写统计", stats["kept"] == 2 and stats["removed"] == 1)
+    check("Node file 仅保留 proxies", list(rewritten) == ["proxies"])
+    check("Node file 删除不合格节点", len(rewritten["proxies"]) == 2
+          and all(p["server"] != "3.4.5.6" for p in rewritten["proxies"]))
+    check("Node file 名称同步检测地区",
+          [p["name"] for p in rewritten["proxies"]] == [r["display_name"] for r in results[:2]])
+
+    with open(path, encoding="utf-8") as f:
+        before_failed_check = f.read()
+    try:
+        cn.rebuild_node_file([dict(results[0], type_verified=False)], settings)
+        guard_raised = False
+    except RuntimeError:
+        guard_raised = True
+    with open(path, encoding="utf-8") as f:
+        check("双源全部失败时禁止误清空", guard_raised and f.read() == before_failed_check)
 
 
 def main():
@@ -217,9 +452,15 @@ def main():
     test_truncated_base64()
     test_host_validation()
     asyncio.run(test_risk_levels())
+    asyncio.run(test_process_concurrency())
     test_probe_classification()
     test_purity_split()
     test_rebuild_sources()
+    test_clash_yaml_conversion()
+    test_cross_validation()
+    asyncio.run(test_partial_source_cache())
+    test_ippure_payload()
+    test_output_rename_and_node_file()
 
     print()
     print(f"通过 {len(PASSED)} / 失败 {len(FAILED)}")

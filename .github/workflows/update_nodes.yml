@@ -34,6 +34,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Install Chromium
+        run: |
+          python -m playwright install --with-deps chromium
+
       - name: Run regression tests
         run: |
           python scripts/test_parser.py
@@ -85,5 +89,6 @@ jobs:
           file_pattern: |
             output/*
             config/sources.txt
+            config/Node file
           skip_checkout: true
           create_parent_directories: true

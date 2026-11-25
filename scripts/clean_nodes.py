@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -7,6 +8,7 @@ import socket
 import ssl
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote, unquote, urlencode
 
 try:
     import yaml
@@ -25,6 +27,7 @@ INPUT = "output/raw_nodes.txt"
 HOME_OUTPUT = "output/home_nodes.txt"
 DC_OUTPUT = "output/datacenter_nodes.txt"
 SETTINGS_FILE = "config/settings.yaml"
+CACHE_VERSION = 3
 
 DEFAULT_SETTINGS = {
     "purity_split": 30,
@@ -34,6 +37,7 @@ DEFAULT_SETTINGS = {
     "filter_blacklist": True,
     "reverse_delete_sources": True,
     "sources_file": "config/sources.txt",
+    "node_file": "config/Node file",
     "sources": ["ippure", "ipapi"],
     "blacklist_ips": [
         "120.227.1.43",
@@ -101,6 +105,139 @@ def shared_emoji(count) -> str:
         if val <= upper:
             return emoji
     return "⚫"
+
+
+def as_bool(value, default=None):
+    """把 API/YAML 中常见的布尔表示统一为真正的 bool。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes", "y", "on"):
+            return True
+        if normalized in ("false", "0", "no", "n", "off"):
+            return False
+    return default
+
+
+def replace_remark(raw: str, remark: str) -> str:
+    body, _ = _split_remark(raw)
+    return f"{body}#{remark}"
+
+
+def clash_proxy_to_uri(proxy: Dict) -> str:
+    """将当前节点文件使用的 Clash 协议转换为标准分享链接。"""
+    if not isinstance(proxy, dict):
+        return ""
+    protocol = str(proxy.get("type", "")).lower()
+    server = str(proxy.get("server", "")).strip()
+    port = str(proxy.get("port", "")).strip()
+    if not server or not port:
+        return ""
+    host = f"[{server}]" if ":" in server and not server.startswith("[") else server
+    name = quote(str(proxy.get("name", "未命名")), safe="")
+
+    def common_params() -> Dict:
+        params = {}
+        sni = proxy.get("sni") or proxy.get("servername")
+        if sni:
+            params["sni"] = str(sni)
+        if proxy.get("client-fingerprint"):
+            params["fp"] = str(proxy["client-fingerprint"])
+        if as_bool(proxy.get("skip-cert-verify"), False):
+            params["allowInsecure"] = "1"
+        if proxy.get("alpn"):
+            alpn = proxy["alpn"]
+            params["alpn"] = ",".join(alpn) if isinstance(alpn, list) else str(alpn)
+        return params
+
+    def add_transport(params: Dict) -> None:
+        network = proxy.get("network")
+        if network:
+            params["type"] = str(network)
+        ws = proxy.get("ws-opts") or {}
+        if ws:
+            if ws.get("path"):
+                params["path"] = str(ws["path"])
+            headers = ws.get("headers") or {}
+            ws_host = headers.get("Host") or headers.get("host")
+            if ws_host:
+                params["host"] = str(ws_host)
+
+    if protocol == "ss":
+        cipher = str(proxy.get("cipher", ""))
+        password = str(proxy.get("password", ""))
+        userinfo = base64.urlsafe_b64encode(
+            f"{cipher}:{password}".encode()
+        ).decode().rstrip("=")
+        params = {}
+        plugin = proxy.get("plugin")
+        if plugin:
+            opts = proxy.get("plugin-opts") or {}
+            parts = [str(plugin)]
+            if plugin == "v2ray-plugin":
+                parts.append(f"mode={opts.get('mode', 'websocket')}")
+                for key in ("host", "path"):
+                    if opts.get(key):
+                        parts.append(f"{key}={opts[key]}")
+                if as_bool(opts.get("tls"), False):
+                    parts.append("tls")
+            elif plugin in ("obfs", "simple-obfs"):
+                for key in ("obfs", "obfs-host", "mode", "host"):
+                    if opts.get(key):
+                        parts.append(f"{key}={opts[key]}")
+            if opts.get("mux") is not None:
+                parts.append(f"mux={opts['mux']}")
+            params["plugin"] = ";".join(parts)
+        query = "?" + urlencode(params) if params else ""
+        return f"ss://{userinfo}@{host}:{port}{query}#{name}"
+
+    if protocol in ("vless", "trojan"):
+        params = common_params()
+        add_transport(params)
+        if protocol == "vless":
+            params["encryption"] = str(proxy.get("encryption", "none"))
+            reality = proxy.get("reality-opts") or {}
+            if reality:
+                params["security"] = "reality"
+                if reality.get("public-key"):
+                    params["pbk"] = str(reality["public-key"])
+                if reality.get("short-id"):
+                    params["sid"] = str(reality["short-id"])
+            elif as_bool(proxy.get("tls"), False):
+                params["security"] = "tls"
+            if proxy.get("flow"):
+                params["flow"] = str(proxy["flow"])
+            credential = str(proxy.get("uuid", ""))
+        else:
+            params["security"] = "tls"
+            credential = str(proxy.get("password", ""))
+        query = "?" + urlencode(params) if params else ""
+        return f"{protocol}://{quote(credential, safe='')}@{host}:{port}{query}#{name}"
+
+    if protocol in ("hysteria2", "hy2", "anytls"):
+        params = common_params()
+        if "allowInsecure" in params:
+            params["insecure"] = params.pop("allowInsecure")
+        if protocol in ("hysteria2", "hy2"):
+            for source_key, target_key in (
+                ("obfs", "obfs"), ("obfs-password", "obfs-password"),
+                ("up", "upmbps"), ("down", "downmbps"),
+            ):
+                if proxy.get(source_key) is not None:
+                    params[target_key] = str(proxy[source_key])
+            scheme = "hysteria2"
+        else:
+            scheme = "anytls"
+        credential = str(proxy.get("password") or proxy.get("auth") or "")
+        query = "?" + urlencode(params) if params else ""
+        return f"{scheme}://{quote(credential, safe='')}@{host}:{port}{query}#{name}"
+
+    return ""
 
 
 def load_settings() -> Dict:
@@ -202,7 +339,12 @@ def _split_remark(body: str) -> Tuple[str, str]:
 def _valid_host(host: str) -> bool:
     if not host or len(host) > 253:
         return False
-    return bool(IPV4_RE.fullmatch(host) or HOSTNAME_RE.fullmatch(host))
+    if IPV4_RE.fullmatch(host):
+        try:
+            return ipaddress.ip_address(host).is_global
+        except ValueError:
+            return False
+    return bool(HOSTNAME_RE.fullmatch(host))
 
 
 def _split_host_port(body: str) -> Tuple[str, str]:
@@ -246,6 +388,7 @@ def _parse_ssr(body: str) -> Tuple[str, str]:
 
 
 def _parse_ss(body: str) -> Tuple[str, str]:
+    body = body.split("?", 1)[0]
     if "@" in body and not body.startswith("ss://"):
         rest = body.split("@", 1)[1]
         host, _, port = rest.partition(":")
@@ -311,77 +454,179 @@ class IPSource:
 
 
 class IPPureSource(IPSource):
+    """通过 IPPure 官网读取指定 IP；其数据接口需要页面动态签名。"""
+
     name = "ippure"
-    score_url = "https://api.ippure.net/v2/score"
-    shared_url = "https://api.ippure.net/v2/shared"
+    page_url = "https://ippure.com/"
+
+    def __init__(self, settings: Dict):
+        super().__init__(settings)
+        self._playwright = None
+        self._browser = None
+        self._browser_lock = asyncio.Lock()
+        self._page_semaphore = asyncio.Semaphore(
+            max(1, min(4, int(settings["concurrency"])))
+        )
 
     @staticmethod
-    def _first(data: Dict, keys: List[str], default=None):
-        for k in keys:
-            if k in data and data[k] is not None:
-                return data[k]
-        return default
+    def parse_payload(ip: str, basic: Dict, risk: Dict) -> Optional[Dict]:
+        if not all(isinstance(payload, dict) and payload.get("ok") is True
+                   for payload in (basic, risk)):
+            return None
+        basic_data = basic.get("data") or {}
+        risk_data = risk.get("data") or {}
+        if str(basic_data.get("ip", "")) != ip:
+            return None
 
-    async def check(self, session, ip: str) -> Optional[Dict]:
-        async with self.limiter.acquire():
-            pass
+        asn = basic_data.get("asn") or {}
+        traits = basic_data.get("traits") or {}
+        is_residential = as_bool(asn.get("is_residential"), None)
+        if is_residential is None:
+            ip_type = str(asn.get("type", "")).lower()
+            if ip_type in ("hosting", "datacenter", "idc"):
+                is_residential = False
+            elif ip_type in ("residential", "isp"):
+                is_residential = True
+        is_broadcast = as_bool(traits.get("is_broadcast"), None)
+        score = risk_data.get("risk_score")
+        if is_residential is None or is_broadcast is None or score is None:
+            return None
         try:
-            async with session.get(self.score_url, params={"ip": ip}) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json(content_type=None)
-        except Exception:
+            score = int(float(score))
+        except (TypeError, ValueError):
+            return None
+        if not 0 <= score <= 100:
             return None
 
-        score = self._first(data, ["riskScore", "fraudScore", "score"])
-        if score is None:
-            return None
+        geo = basic_data.get("geo") or {}
+        country_code = ""
+        for provider in ("IP2Location", "MaxMind", "DB-IP"):
+            location = geo.get(provider) or {}
+            if location.get("country_code"):
+                country_code = str(location["country_code"]).upper()
+                break
 
-        ip_type = str(self._first(data, ["ipType", "ip_type", "type"], "")).lower()
-        is_resi = self._first(data, ["isResidential"], None)
-        if is_resi is None:
-            is_resi = ip_type in ("residential", "isp")
-        is_datacenter = self._first(data, ["isDatacenter"], None)
-        if is_datacenter is None:
-            is_datacenter = ip_type in ("datacenter", "idc")
-
-        result = {
-            "ip": self._first(data, ["ip"], ip),
-            "risk_score": int(score),
-            "is_residential": bool(is_resi),
-            "is_datacenter": bool(is_datacenter),
-            "is_broadcast": bool(self._first(data, ["isBroadcast"], False)),
-            "is_vpn": bool(self._first(data, ["isVpn", "isVPN"], False)),
+        return {
+            "ip": ip,
+            "risk_score": score,
+            "is_residential": is_residential,
+            "is_datacenter": not is_residential,
+            "is_broadcast": is_broadcast,
+            # 该接口不提供 VPN 结论，VPN 由 ip-api 交叉检查。
+            "is_vpn": None,
             "shared_users": None,
-            "country": self._first(data, ["country", "countryName"], ""),
-            "source": self.name,
+            "country": "",
+            "country_code": country_code,
+            "source": "ippure",
         }
 
-        try:
+    async def _get_browser(self):
+        async with self._browser_lock:
+            if self._browser is not None and self._browser.is_connected():
+                return self._browser
+            try:
+                from playwright.async_api import async_playwright
+            except ImportError as exc:
+                raise RuntimeError(
+                    "缺少 playwright，请执行 pip install -r requirements.txt "
+                    "并运行 python -m playwright install --with-deps chromium"
+                ) from exc
+
+            self._playwright = await async_playwright().start()
+            proxy = (
+                self.settings.get("browser_proxy")
+                or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+                or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+            )
+            try:
+                self._browser = await self._playwright.chromium.launch(
+                    headless=True,
+                    proxy={"server": proxy} if proxy else None,
+                )
+            except Exception:
+                await self._playwright.stop()
+                self._playwright = None
+                raise
+            return self._browser
+
+    async def check(self, session, ip: str) -> Optional[Dict]:
+        # 复用一个浏览器进程；每个 IP 使用独立页面，最多并发 4 页。
+        async with self._page_semaphore:
             async with self.limiter.acquire():
                 pass
-            async with session.get(self.shared_url, params={"ip": ip}) as resp:
-                if resp.status == 200:
-                    shared_data = await resp.json(content_type=None)
-                    users = self._first(shared_data, ["shared", "sharedUsers", "sharedCount"])
-                    if users is not None:
-                        result["shared_users"] = users
-        except Exception:
-            pass
+            page = None
+            try:
+                browser = await self._get_browser()
+                page = await browser.new_page()
+                timeout = max(30, int(self.settings["request_timeout"])) * 1000
+                basic_path = f"/api/info/ip-basic/{ip}"
+                risk_path = f"/api/info/ip-risk/{ip}"
 
-        return result
+                def is_signed_response(response, path: str) -> bool:
+                    return response.url.endswith(path) and bool(
+                        response.request.headers.get("x-t")
+                    )
+
+                async with page.expect_response(
+                    lambda response: is_signed_response(response, basic_path),
+                    timeout=timeout,
+                ) as basic_wait:
+                    async with page.expect_response(
+                        lambda response: is_signed_response(response, risk_path),
+                        timeout=timeout,
+                    ) as risk_wait:
+                        response = await page.goto(
+                            f"{self.page_url}?ip={ip}",
+                            wait_until="domcontentloaded",
+                            timeout=timeout,
+                        )
+                        if response is None or response.status != 200:
+                            return None
+                basic_response = await basic_wait.value
+                risk_response = await risk_wait.value
+                if basic_response.status != 200 or risk_response.status != 200:
+                    return None
+                basic = await basic_response.json()
+                risk = await risk_response.json()
+                return self.parse_payload(ip, basic, risk)
+            except Exception:
+                return None
+            finally:
+                if page is not None:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+
+    async def close(self):
+        async with self._page_semaphore:
+            if self._browser is not None:
+                try:
+                    await self._browser.close()
+                except Exception:
+                    pass
+                self._browser = None
+            if self._playwright is not None:
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    pass
+                self._playwright = None
 
 
 class IPAPISource(IPSource):
     name = "ipapi"
     url = "http://ip-api.com/json"
-    fields = "status,country,city,isp,as,asname,proxy,hosting,query"
+    fields = "status,country,countryCode,regionName,city,isp,as,asname,proxy,hosting,query"
 
     async def check(self, session, ip: str) -> Optional[Dict]:
         async with self.limiter.acquire():
             pass
         try:
-            async with session.get(self.url + "/" + ip, params={"fields": self.fields}) as resp:
+            async with session.get(
+                self.url + "/" + ip,
+                params={"fields": self.fields, "lang": "zh-CN"},
+            ) as resp:
                 if resp.status != 200:
                     return None
                 data = await resp.json()
@@ -391,8 +636,8 @@ class IPAPISource(IPSource):
         if not isinstance(data, dict) or data.get("status") != "success":
             return None
 
-        hosting = bool(data.get("hosting"))
-        proxy = bool(data.get("proxy"))
+        hosting = as_bool(data.get("hosting"), False)
+        proxy = as_bool(data.get("proxy"), False)
         # 纯净度评分：普通住宅/家用 IP 最干净（10），普通机房 IP 稍高（20），
         # 被判为代理/VPN 的 IP 风险最高（95）。
         # 这样机房节点也能落进 purity_split(30) 以内的"绿/白"纯净桶。
@@ -402,10 +647,12 @@ class IPAPISource(IPSource):
             "risk_score": risk_score,
             "is_residential": not hosting,
             "is_datacenter": hosting,
-            "is_broadcast": False,
+            # ip-api 不提供原生/广播判定，未知时绝不能默认写成“原生”。
+            "is_broadcast": None,
             "is_vpn": proxy,
             "shared_users": None,
             "country": data.get("country", ""),
+            "country_code": str(data.get("countryCode", "")).upper(),
             "isp": data.get("isp", ""),
             "asname": data.get("asname", ""),
             "source": self.name,
@@ -416,6 +663,69 @@ SOURCES = {
     "ippure": IPPureSource,
     "ipapi": IPAPISource,
 }
+
+
+def merge_ip_results(results: List[Dict]) -> Optional[Dict]:
+    """合并所有数据源；住宅/机房必须双源一致，冲突时拒绝输出。"""
+    valid = [r for r in results if r]
+    if not valid:
+        return None
+
+    merged = dict(valid[0])
+
+    def ip_type(result: Dict) -> str:
+        residential = as_bool(result.get("is_residential"), None)
+        datacenter = as_bool(result.get("is_datacenter"), None)
+        if residential is True and datacenter is not True:
+            return "residential"
+        if datacenter is True and residential is not True:
+            return "datacenter"
+        return "unknown"
+
+    types = [ip_type(r) for r in valid]
+    known_types = {t for t in types if t != "unknown"}
+    merged["classification_conflict"] = len(known_types) > 1
+    merged["type_verified"] = (
+        len(valid) >= 2 and len(known_types) == 1
+        and all(t != "unknown" for t in types)
+    )
+    verified_type = next(iter(known_types)) if len(known_types) == 1 else ""
+    merged["is_residential"] = verified_type == "residential"
+    merged["is_datacenter"] = verified_type == "datacenter"
+
+    native_values = [
+        as_bool(r.get("is_broadcast"), None) for r in valid
+        if as_bool(r.get("is_broadcast"), None) is not None
+    ]
+    merged["native_conflict"] = len(set(native_values)) > 1
+    merged["is_broadcast"] = native_values[0] if native_values and not merged["native_conflict"] else None
+
+    scores = []
+    for result in valid:
+        try:
+            scores.append(int(float(result.get("risk_score"))))
+        except (TypeError, ValueError):
+            continue
+    merged["risk_score"] = max(scores) if scores else None
+    merged["is_vpn"] = any(as_bool(r.get("is_vpn"), False) for r in valid)
+    merged["shared_users"] = next(
+        (r.get("shared_users") for r in valid if r.get("shared_users") is not None), None
+    )
+
+    geo_source = next(
+        (r for r in valid if r.get("source") == "ipapi" and r.get("country")),
+        valid[0],
+    )
+    merged["country"] = str(geo_source.get("country") or "").strip()
+    merged["country_code"] = str(geo_source.get("country_code") or "").upper()
+    country_codes = {
+        str(r.get("country_code")).upper() for r in valid if r.get("country_code")
+    }
+    merged["country_conflict"] = len(country_codes) > 1
+    merged["source"] = "+".join(str(r.get("source", "unknown")) for r in valid)
+    merged["source_count"] = len(valid)
+    merged["cache_version"] = CACHE_VERSION
+    return merged
 
 
 class IPChecker:
@@ -429,6 +739,7 @@ class IPChecker:
         if not self.sources:
             raise RuntimeError("没有可用的 IP 检测数据源，请检查 config/settings.yaml 的 sources")
         self.cache: Dict[str, Optional[Dict]] = {}
+        self._ip_locks: Dict[str, asyncio.Lock] = {}
         self.cache_file = settings.get("ip_cache_file", "output/ip_cache.json")
         self._load_disk_cache()
 
@@ -438,7 +749,13 @@ class IPChecker:
                 with open(self.cache_file, encoding="utf-8") as fh:
                     data = json.load(fh)
                 if isinstance(data, dict):
-                    self.cache = {str(k): v for k, v in data.items()}
+                    # 旧缓存可能包含 ip-api 默认“原生”等错误结论，直接弃用。
+                    self.cache = {
+                        str(k): v for k, v in data.items()
+                        if isinstance(v, dict)
+                        and v.get("cache_version") == CACHE_VERSION
+                        and v.get("source_count") == len(self.sources)
+                    }
         except Exception:
             self.cache = {}
 
@@ -453,16 +770,32 @@ class IPChecker:
     async def check(self, session, ip: str) -> Optional[Dict]:
         if ip in self.cache:
             return self.cache[ip]
-        result = None
+        lock = self._ip_locks.setdefault(ip, asyncio.Lock())
+        async with lock:
+            # 等待同 IP 的前一个任务完成后再查缓存，避免重复请求和结果覆盖。
+            if ip in self.cache:
+                return self.cache[ip]
+            results = []
+            for source in self.sources:
+                try:
+                    result = await source.check(session, ip)
+                except Exception:
+                    result = None
+                if result is not None:
+                    results.append(result)
+            merged = merge_ip_results(results)
+            # 只缓存本轮所有配置源均已返回的结果；单源临时失败必须在下轮重试。
+            if merged and merged.get("source_count") == len(self.sources):
+                self.cache[ip] = merged
+            else:
+                self.cache.pop(ip, None)
+            return merged
+
+    async def close(self):
         for source in self.sources:
-            try:
-                result = await source.check(session, ip)
-            except Exception:
-                result = None
-            if result is not None:
-                break
-        self.cache[ip] = result
-        return result
+            close = getattr(source, "close", None)
+            if close is not None:
+                await close()
 
 
 class NodeProcessor:
@@ -554,7 +887,13 @@ class NodeProcessor:
             "is_vpn": is_vpn,
             "shared_users": info.get("shared_users") if info else None,
             "country": (info or {}).get("country", ""),
+            "country_code": (info or {}).get("country_code", ""),
             "source": (info or {}).get("source", ""),
+            "source_count": (info or {}).get("source_count", 0),
+            "type_verified": (info or {}).get("type_verified", False),
+            "classification_conflict": (info or {}).get("classification_conflict", False),
+            "country_conflict": (info or {}).get("country_conflict", False),
+            "native_conflict": (info or {}).get("native_conflict", False),
             "emoji": emoji,
             "attr": attr,
             "ip_src": src,
@@ -577,6 +916,20 @@ class NodeProcessor:
             record["should_filter"] = True
             record["risk_level"] = "UNKNOWN"
             record["filter_reason"] = "IP 黑名单"
+            return None, record
+
+        validation_reason = ""
+        if info:
+            if record["classification_conflict"]:
+                validation_reason = "住宅/机房属性在多数据源间冲突"
+            elif record["country_conflict"]:
+                validation_reason = "国家/地区在多数据源间冲突"
+            elif record["native_conflict"] or record["is_broadcast"] is True:
+                validation_reason = "非原生或原生属性冲突"
+        if validation_reason:
+            record["risk_level"] = "RISKY"
+            record["should_filter"] = True
+            record["filter_reason"] = validation_reason
             return None, record
 
         risk_level = "CLEAN"
@@ -608,12 +961,14 @@ class NodeProcessor:
             timeout=aiohttp.ClientTimeout(total=self.settings["request_timeout"]),
             connector=connector,
             headers=headers,
+            trust_env=True,
         ) as session:
             async def worker(node: Node):
                 async with sem:
                     return await self.process_one(node, session, loop)
 
-            for idx, node in enumerate(nodes, 1):
+            tasks = [asyncio.create_task(worker(node)) for node in nodes]
+            for idx, (node, task) in enumerate(zip(nodes, tasks), 1):
                 if idx % 25 == 0 or idx == len(nodes):
                     print(f"  处理中: {idx}/{len(nodes)}", end="\r", flush=True)
 
@@ -623,7 +978,7 @@ class NodeProcessor:
                     self.stats["domain_only"] += 1
 
                 try:
-                    labeled, record = await worker(node)
+                    labeled, record = await task
                 except Exception as e:
                     print(f"\n⚠️ 处理节点失败: {str(e)[:120]}")
                     record = {
@@ -665,6 +1020,9 @@ class NodeProcessor:
                     final_nodes.append(labeled)
 
         self.checker.save_disk_cache()
+        close_checker = getattr(self.checker, "close", None)
+        if close_checker is not None:
+            await close_checker()
 
         print("\n")
         return final_nodes, self.results, risky_nodes
@@ -811,7 +1169,11 @@ def rebuild_sources(results: List[Dict], settings: Dict) -> Dict:
                     continue
                 node = parse_node(stripped, protocols)
                 if node is None:
-                    preamble.append(line)
+                    # 能识别协议头但主机/格式无效的是坏节点，不作为普通未知行保留。
+                    if low.startswith(tuple(p.lower() for p in protocols)):
+                        removed += 1
+                    else:
+                        preamble.append(line)
                     continue
                 if node.raw in keep_clean or node.raw in keep_unknown:
                     continue
@@ -825,6 +1187,78 @@ def rebuild_sources(results: List[Dict], settings: Dict) -> Dict:
             f.write(raw + "\n")
 
     return {"clean": len(keep_clean), "unknown": len(keep_unknown), "removed": removed}
+
+
+def is_output_eligible(record: Dict, split: int) -> bool:
+    """只有双源一致、明确原生且地区可用的低风险节点才允许输出。"""
+    try:
+        clean = record.get("risk_score") is not None and int(record["risk_score"]) <= split
+    except (TypeError, ValueError):
+        clean = False
+    return bool(
+        clean
+        and not record.get("should_filter")
+        and record.get("type_verified")
+        and record.get("is_broadcast") is False
+        and (record.get("is_residential") or record.get("is_datacenter"))
+        and str(record.get("country") or "").strip()
+    )
+
+
+def build_outputs(results: List[Dict], split: int) -> Tuple[List[str], List[str]]:
+    """按真实检测地区重新命名，并用序号避免同地区节点重名。"""
+    home_nodes = []
+    dc_nodes = []
+    location_counts = {}
+    for record in results:
+        if not is_output_eligible(record, split):
+            continue
+        country = str(record["country"]).strip()
+        location_counts[country] = location_counts.get(country, 0) + 1
+        display_name = f"{record['label']} {country} {location_counts[country]:02d}"
+        record["display_name"] = display_name
+        record["out"] = replace_remark(record["raw"], display_name)
+        if record.get("is_residential"):
+            home_nodes.append(record["out"])
+        else:
+            dc_nodes.append(record["out"])
+    return home_nodes, dc_nodes
+
+
+def rebuild_node_file(results: List[Dict], settings: Dict) -> Dict:
+    """Node file 只保留可输出的合格 proxies，其余配置和节点全部删除。"""
+    path = settings.get("node_file", "config/Node file")
+    if not os.path.exists(path):
+        return {"total": 0, "kept": 0, "removed": 0}
+    if yaml is None:
+        raise RuntimeError("缺少 pyyaml，无法维护 Clash 节点文件")
+
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    proxies = data.get("proxies", [])
+    if not isinstance(proxies, list):
+        raise ValueError(f"{path} 中缺少有效的 proxies 列表")
+
+    if proxies and results and not any(r.get("type_verified") for r in results):
+        raise RuntimeError("本轮没有节点完成双源校验，为避免 API 故障误清空，拒绝回写 Node file")
+
+    result_by_raw = {r.get("raw"): r for r in results if r.get("raw")}
+    split = settings["purity_split"]
+    kept = []
+    seen = set()
+    for proxy in proxies:
+        raw = clash_proxy_to_uri(proxy)
+        record = result_by_raw.get(raw)
+        if not raw or raw in seen or not record or not is_output_eligible(record, split):
+            continue
+        seen.add(raw)
+        cleaned = dict(proxy)
+        cleaned["name"] = record["display_name"]
+        kept.append(cleaned)
+
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump({"proxies": kept}, f, allow_unicode=True, sort_keys=False)
+    return {"total": len(proxies), "kept": len(kept), "removed": len(proxies) - len(kept)}
 
 
 async def main():
@@ -901,20 +1335,9 @@ async def main():
 
     os.makedirs("output", exist_ok=True)
 
-    # 切分纯净度 <= purity_split 的家宽/机房节点
+    # 输出条件不变：风险分 <= split，分住宅/机房；另加双源、原生和地区校验。
     split = settings["purity_split"]
-    home_nodes: List[str] = []
-    dc_nodes: List[str] = []
-    for r in results:
-        if r.get("should_filter"):
-            continue
-        score = r.get("risk_score")
-        if score is None or int(score) > split:
-            continue
-        if r.get("is_residential"):
-            home_nodes.append(r.get("out") or "")
-        elif r.get("is_datacenter"):
-            dc_nodes.append(r.get("out") or "")
+    home_nodes, dc_nodes = build_outputs(results, split)
 
     with open(HOME_OUTPUT, "w", encoding="utf-8") as f:
         for node in home_nodes:
@@ -926,15 +1349,20 @@ async def main():
             f.write(node + "\n")
     print(f"🏢 原生机房(纯净度<={split}%): {DC_OUTPUT} ({len(dc_nodes)} 条)")
 
-    # 维护 sources.txt：删除 URL/base64/死节点/高纯净度节点，写回纯净与未知节点
+    # sources.txt 保持原策略；Node file 严格到“只保留本次可输出节点”。
     if settings.get("reverse_delete_sources"):
+        node_stats = rebuild_node_file(results, settings)
+        print(
+            f"🗑  维护 {settings.get('node_file', 'config/Node file')}: "
+            f"保留 {node_stats['kept']} / 删除 {node_stats['removed']}"
+        )
         stats = rebuild_sources(results, settings)
         print(
             f"🗑  维护 sources.txt: 删除 {stats['removed']} 条"
             f"（URL/base64 与死/脏节点），写回 纯净 {stats['clean']} / 未知 {stats['unknown']}"
         )
     else:
-        print("🗑  sources.txt 维护已关闭 (reverse_delete_sources: false)")
+        print("🗑  sources.txt 与 Node file 维护已关闭 (reverse_delete_sources: false)")
 
     print("=" * 70)
     print("✨ 所有任务完成！")
