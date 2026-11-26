@@ -30,10 +30,10 @@ filter_vpn: true
 
 # --- 反向删除 / sources.txt 维护 ---
 # 是否在每次清洗后自动维护 config/sources.txt（自维护节点池）：
-# - 删除：订阅 URL、base64 块（已抓取/解码完毕）、无法连接的节点、
-#   纯净度高于 purity_split 的节点、命中黑名单/风险的节点
+# - 删除：无法连接的节点、纯净度高于 purity_split 的节点、命中黑名单/风险的节点
 # - 写回：纯净度 <= purity_split 的节点、可达但未知（无检测结果）的节点
-# - 保留：注释、空行、无法解析的行（按未知处理）
+# - 保留：订阅 URL / base64 来源（保证每次运行都能继续从上游拉新）、
+#   注释、空行、无法解析的行（按未知处理）
 reverse_delete_sources: true
 
 # 被维护的源文件路径
@@ -47,11 +47,27 @@ blacklist_ips:
   - 120.227.1.43
   - 47.240.80.220
 
-# --- 检测数据源（按顺序尝试，前一个失败自动降级到下一个）---
-# ippure : api.ippure.net，返回风险分 + 宽带类型 + IP 来源 + 共享人数
-# ipapi  : ip-api.com，备用源，返回宽带类型（机房/住宅）
+# --- 机房识别补充规则（可选）---
+# ip-api 的 hosting 字段会把部分托管商误判成住宅，脚本内置了一批常见
+# 云厂商/托管商 ASN 与关键词。发现新的误判商机后可以在这里追加。
+# 示例：
+# hosting_asns:
+#   - AS12345
+# hosting_keywords:
+#   - "some-host-provider"
+hosting_asns: []
+hosting_keywords: []
+
+# --- 检测数据源（会合并所有源的结果，不是"第一个成功就停"）---
+# ipinfo: ipinfo.io，提供 asn.type / company.type / privacy.hosting，
+#         能识别 ip-api 误判为住宅的机房 IP（推荐，免 key）
+#         注意：公共接口约 1000 次/天且同出口 IP 共享，被限流时会自动
+#         降级到 ipapi + 内置 ASN/关键词启发式判定
+# ipapi : ip-api.com，补充风险分/代理标记/归属地
+# ippure: api.ippure.net，提供风险分 + 共享人数（可选，接口不稳定）
+# 机房判定规则：任意一源判定 hosting/机房即按机房处理；风险分取各源最大值。
 sources:
-  - ippure
+  - ipinfo
   - ipapi
 
 # --- 支持的节点协议 ---
@@ -77,6 +93,7 @@ request_timeout: 8
 
 # 各数据源的请求速率上限（次/分钟），防止被限流
 rate:
+  ipinfo: 120
   ippure: 25
   ipapi: 40
 

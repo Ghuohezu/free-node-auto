@@ -39,11 +39,13 @@ DEFAULT_SETTINGS = {
     "filter_blacklist": True,
     "reverse_delete_sources": True,
     "sources_file": "config/sources.txt",
-    "sources": ["ippure", "ipapi"],
+    "sources": ["ipinfo", "ipapi"],
     "blacklist_ips": [
         "120.227.1.43",
         "47.240.80.220",
     ],
+    "hosting_asns": [],
+    "hosting_keywords": [],
     "protocols": [
         "vmess://", "vless://", "ss://", "ssr://", "trojan://",
         "anytls://", "hysteria://", "hysteria2://", "hy2://", "hy://",
@@ -53,6 +55,7 @@ DEFAULT_SETTINGS = {
     "request_timeout": 8,
     "dns_timeout": 5,
     "rate": {
+        "ipinfo": 120,
         "ippure": 25,
         "ipapi": 40,
     },
@@ -61,6 +64,25 @@ DEFAULT_SETTINGS = {
     "probe_tls": True,
     "user_agent": "Mozilla/5.0 (X11; Linux x86_64) node-cleaner/2.0",
 }
+
+# ASN/组织名启发式：ip-api 的 hosting 字段对部分托管商识别不准（例如
+# Cornseed、Awas.ovh、Skinark 会被判成住宅），这里做一层补充判定。
+# 可在 config/settings.yaml 的 hosting_asns / hosting_keywords 里继续追加。
+HOSTING_ASNS = {
+    "AS16509", "AS14618", "AS15169", "AS396982", "AS8075", "AS13335",
+    "AS14061", "AS20473", "AS63949", "AS16276", "AS24940", "AS51167",
+    "AS9009", "AS36352", "AS45102", "AS37963", "AS132203", "AS31898",
+    "AS209363", "AS201279", "AS206069", "AS984", "AS56380",
+}
+HOSTING_KEYWORDS = [
+    "amazon", "aws", "google cloud", "googleusercontent", "cloudflare",
+    "microsoft", "azure", "oracle", "alibaba", "aliyun", "tencent",
+    "huawei cloud", "digitalocean", "vultr", "linode", "akamai", "hetzner",
+    "ovh", "leaseweb", "contabo", "m247", "psychz", "quadranet",
+    "colocrossing", "choopa", "datacamp", "hostinger", "godaddy", "ionos",
+    "gcore", "upcloud", "scaleway", "hosting", "datacenter", "data center",
+    "idc", "vps", "dedicated server", "cloud",
+]
 
 # 纯净度 Emoji 对照表（与 clash-ip-checker core/sources/base.py 保持一致）
 PURITY_TABLE = [
@@ -394,7 +416,27 @@ class IPPureSource(IPSource):
 class IPAPISource(IPSource):
     name = "ipapi"
     url = "http://ip-api.com/json"
-    fields = "status,country,city,isp,as,asname,proxy,hosting,query"
+    fields = "status,country,city,isp,as,asname,org,proxy,hosting,query"
+
+    def __init__(self, settings: Dict):
+        super().__init__(settings)
+        self.hosting_asns = {a.upper() for a in HOSTING_ASNS}
+        self.hosting_asns.update(
+            str(a).upper() for a in (settings.get("hosting_asns") or [])
+        )
+        self.hosting_keywords = list(HOSTING_KEYWORDS)
+        self.hosting_keywords.extend(
+            str(k).lower() for k in (settings.get("hosting_keywords") or [])
+        )
+
+    def _looks_like_hosting(self, *values) -> bool:
+        text = " ".join(str(v).lower() for v in values if v)
+        if not text:
+            return False
+        if any(k in text for k in self.hosting_keywords):
+            return True
+        asns = set(re.findall(r"as\d+", text))
+        return bool(asns & {a.lower() for a in self.hosting_asns})
 
     async def check(self, session, ip: str) -> Optional[Dict]:
         async with self.limiter.acquire():
@@ -410,8 +452,10 @@ class IPAPISource(IPSource):
         if not isinstance(data, dict) or data.get("status") != "success":
             return None
 
-        hosting = bool(data.get("hosting"))
         proxy = bool(data.get("proxy"))
+        hosting = bool(data.get("hosting")) or self._looks_like_hosting(
+            data.get("as"), data.get("asname"), data.get("isp"), data.get("org")
+        )
         # 纯净度评分：普通住宅/家用 IP 最干净（10），普通机房 IP 稍高（20），
         # 被判为代理/VPN 的 IP 风险最高（95）。
         # 这样机房节点也能落进 purity_split(30) 以内的"绿/白"纯净桶。
@@ -431,10 +475,104 @@ class IPAPISource(IPSource):
         }
 
 
+def _parse_ipinfo(data: Dict, ip: str) -> Optional[Dict]:
+    """解析 ipinfo.io/widget/demo 返回的数据。
+
+    它提供 asn.type / company.type / privacy.hosting，能识别出 ip-api
+    误判为住宅的机房 IP（例如 Cornseed、Awas.ovh 这类托管商）。
+    """
+    if not isinstance(data, dict) or not data.get("ip"):
+        return None
+    asn = data.get("asn") or {}
+    company = data.get("company") or {}
+    privacy = data.get("privacy") or {}
+    asn_type = str(asn.get("type") or "").lower()
+    company_type = str(company.get("type") or "").lower()
+    hosting = (
+        bool(privacy.get("hosting"))
+        or asn_type == "hosting"
+        or company_type == "hosting"
+    )
+    vpn = bool(privacy.get("vpn")) or bool(privacy.get("proxy")) or bool(privacy.get("tor"))
+    risk_score = 95 if vpn else (20 if hosting else 10)
+    return {
+        "ip": data.get("ip", ip),
+        "risk_score": risk_score,
+        "is_residential": not hosting,
+        "is_datacenter": hosting,
+        "is_broadcast": None,
+        "is_vpn": vpn,
+        "shared_users": None,
+        "country": data.get("country", ""),
+        "isp": company.get("name") or asn.get("name") or "",
+        "asname": asn.get("name") or "",
+        "source": "ipinfo",
+    }
+
+
+class IPInfoSource(IPSource):
+    name = "ipinfo"
+    url = "https://ipinfo.io/widget/demo"
+
+    async def check(self, session, ip: str) -> Optional[Dict]:
+        async with self.limiter.acquire():
+            pass
+        try:
+            async with session.get(f"{self.url}/{ip}") as resp:
+                if resp.status != 200:
+                    return None
+                payload = await resp.json(content_type=None)
+        except Exception:
+            return None
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            data = payload
+        return _parse_ipinfo(data, ip)
+
+
 SOURCES = {
+    "ipinfo": IPInfoSource,
     "ippure": IPPureSource,
     "ipapi": IPAPISource,
 }
+
+
+def merge_ip_info(results: List[Dict]) -> Optional[Dict]:
+    """合并多源结果：机房/代理判定取"任意一源命中"，风险分取最大值。
+
+    这样 ip-api 判住宅、ipinfo 判机房时，最终会按机房处理，避免把机房节点
+    错误输出到家宽列表。
+    """
+    if not results:
+        return None
+    base = dict(results[0])
+    is_datacenter = any(bool(r.get("is_datacenter")) for r in results)
+    is_vpn = any(bool(r.get("is_vpn")) for r in results)
+    scores = [r.get("risk_score") for r in results if r.get("risk_score") is not None]
+    is_broadcast = next(
+        (r.get("is_broadcast") for r in results if r.get("is_broadcast") is not None),
+        None,
+    )
+    shared = next(
+        (r.get("shared_users") for r in results if r.get("shared_users") is not None),
+        None,
+    )
+    for key in ("ip", "country", "isp", "asname"):
+        if not base.get(key):
+            base[key] = next((r.get(key) for r in results if r.get(key)), "")
+    base.update({
+        "risk_score": max(scores) if scores else None,
+        "is_datacenter": is_datacenter,
+        "is_residential": (not is_datacenter)
+        and any(bool(r.get("is_residential")) for r in results),
+        "is_vpn": is_vpn,
+        "is_broadcast": is_broadcast,
+        "shared_users": shared,
+        "source": "+".join(
+            str(r.get("source") or "") for r in results if r.get("source")
+        ) or base.get("source", ""),
+    })
+    return base
 
 
 class IPChecker:
@@ -457,31 +595,36 @@ class IPChecker:
                 with open(self.cache_file, encoding="utf-8") as fh:
                     data = json.load(fh)
                 if isinstance(data, dict):
-                    self.cache = {str(k): v for k, v in data.items()}
+                    # 只加载成功结果，失败结果下次重新检测（避免一次 429 永久污染缓存）
+                    self.cache = {
+                        str(k): v for k, v in data.items() if v is not None
+                    }
         except Exception:
             self.cache = {}
 
     def save_disk_cache(self):
         os.makedirs(os.path.dirname(self.cache_file) or ".", exist_ok=True)
         try:
+            data = {k: v for k, v in self.cache.items() if v is not None}
             with open(self.cache_file, "w", encoding="utf-8") as fh:
-                json.dump(self.cache, fh, ensure_ascii=False)
+                json.dump(data, fh, ensure_ascii=False)
         except Exception:
             pass
 
     async def check(self, session, ip: str) -> Optional[Dict]:
         if ip in self.cache:
             return self.cache[ip]
-        result = None
+        results: List[Dict] = []
         for source in self.sources:
             try:
                 result = await source.check(session, ip)
             except Exception:
                 result = None
             if result is not None:
-                break
-        self.cache[ip] = result
-        return result
+                results.append(result)
+        merged = merge_ip_info(results)
+        self.cache[ip] = merged
+        return merged
 
 
 class NodeProcessor:
@@ -625,7 +768,7 @@ class NodeProcessor:
         self.stats["total"] = len(nodes)
         sem = asyncio.Semaphore(max(1, self.settings["concurrency"]))
         loop = asyncio.get_event_loop()
-        connector = aiohttp.TCPConnector(limit=max(1, self.settings["concurrency"]), ssl=False)
+        connector = aiohttp.TCPConnector(limit=max(1, self.settings["concurrency"]))
         headers = {"User-Agent": self.settings["user_agent"]}
         final_nodes: List[str] = []
         risky_nodes: List[str] = []
@@ -795,15 +938,16 @@ def is_base64_block(text: str) -> bool:
 
 
 def rebuild_sources(results: List[Dict], settings: Dict) -> Dict:
-    """维护 config/sources.txt，使其成为自维护的节点池。
+    """维护 config/sources.txt，使其成为可持续刷新的节点池。
 
     写回（由本次清洗结果驱动）：
     - 纯净度 <= purity_split 的节点（含从订阅 URL/base64 解码出来的）
     - 可达但未知（无检测结果）的节点
+    保留：
+    - 订阅 URL / base64 块（保证每次运行都能继续从上游拉取新节点）
+    - 注释、空行、无法解析的行
     删除：
-    - 订阅 URL、base64 块（已抓取/解码完毕）
     - 无法连接的节点、纯净度高于 purity_split 的节点、命中黑名单/风险的节点
-    保留：注释、空行、无法解析的行（按未知处理）
     返回统计字典。
     """
     sources_file = settings["sources_file"]
@@ -835,7 +979,8 @@ def rebuild_sources(results: List[Dict], settings: Dict) -> Dict:
                     continue
                 low = stripped.lower()
                 if low.startswith(("http://", "https://")) or is_base64_block(stripped):
-                    removed += 1
+                    # 保留订阅来源，避免首次运行后断掉上游刷新
+                    preamble.append(line)
                     continue
                 node = parse_node(stripped, protocols)
                 if node is None:
@@ -984,7 +1129,7 @@ async def main():
         stats = rebuild_sources(results, settings)
         print(
             f"🗑  维护 sources.txt: 删除 {stats['removed']} 条"
-            f"（URL/base64 与死/脏节点），写回 纯净 {stats['clean']} / 未知 {stats['unknown']}"
+            f"（死/脏节点），写回 纯净 {stats['clean']} / 未知 {stats['unknown']}"
         )
     else:
         print("🗑  sources.txt 维护已关闭 (reverse_delete_sources: false)")

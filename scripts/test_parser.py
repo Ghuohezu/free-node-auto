@@ -196,13 +196,14 @@ def test_rebuild_sources():
           and sum(1 for l in lines if "2.2.2.2" in l) == 1
           and sum(1 for l in lines if "6.6.6.6" in l) == 1, str(lines))
     check("rebuild 未知写回", any("4.4.4.4" in l for l in lines), str(lines))
-    check("rebuild URL/base64 删除", not any("example.com" in l or "YWJj" in l for l in lines))
+    check("rebuild 订阅 URL 保留", any("example.com" in l for l in lines), str(lines))
+    check("rebuild base64 块保留", any("YWJj" in l for l in lines), str(lines))
     check("rebuild 死节点删除", not any("5.5.5.5" in l for l in lines))
     check("rebuild 脏节点删除", not any("3.3.3.3" in l for l in lines))
     check("rebuild 注释保留", any(l.startswith("#") for l in lines))
     check("rebuild 未知行保留", any("这不是节点行" in l for l in lines))
     check("rebuild 统计", stats["clean"] == 3 and stats["unknown"] == 1
-          and stats["removed"] == 4, str(stats))
+          and stats["removed"] == 2, str(stats))
     return tmpdir
 
 
@@ -259,6 +260,79 @@ async def test_unknown_info_is_not_clean():
     check("未知计入 unknown", p.stats["unknown"] == 1, f"unknown={p.stats['unknown']}")
 
 
+def test_ipinfo_classification():
+    """ipinfo 的 asn/company type 与 privacy.hosting 必须能识别机房与 VPN"""
+    idc = cn._parse_ipinfo(
+        {"ip": "1.2.3.4", "country": "JP", "asn": {"type": "hosting", "name": "X"},
+         "company": {"type": "business"}, "privacy": {"hosting": True}}, "1.2.3.4")
+    check("ipinfo 机房", bool(idc and idc["is_datacenter"] and not idc["is_residential"]
+                             and idc["risk_score"] == 20), str(idc))
+    resi = cn._parse_ipinfo(
+        {"ip": "1.2.3.4", "asn": {"type": "isp"}, "company": {"type": "isp"},
+         "privacy": {"hosting": False}}, "1.2.3.4")
+    check("ipinfo 住宅", bool(resi and resi["is_residential"] and not resi["is_datacenter"]
+                             and resi["risk_score"] == 10), str(resi))
+    vpn = cn._parse_ipinfo(
+        {"ip": "1.2.3.4", "asn": {"type": "hosting"}, "privacy": {"vpn": True}}, "1.2.3.4")
+    check("ipinfo VPN", bool(vpn and vpn["is_vpn"] and vpn["risk_score"] == 95), str(vpn))
+    check("ipinfo 空数据", cn._parse_ipinfo({}, "1.2.3.4") is None)
+
+
+def test_merge_prefers_datacenter():
+    """多源合并：任意一源判机房即按机房，风险分取最大值，与源顺序无关"""
+    ipapi = {"ip": "1.2.3.4", "risk_score": 10, "is_residential": True,
+             "is_datacenter": False, "is_broadcast": False, "is_vpn": False,
+             "shared_users": None, "country": "JP", "source": "ipapi"}
+    ipinfo = {"ip": "1.2.3.4", "risk_score": 20, "is_residential": False,
+              "is_datacenter": True, "is_broadcast": None, "is_vpn": False,
+              "shared_users": None, "country": "JP", "source": "ipinfo"}
+    m = cn.merge_ip_info([ipinfo, ipapi])
+    check("合并取机房", bool(m and m["is_datacenter"] and not m["is_residential"]
+                           and m["risk_score"] == 20), str(m))
+    m2 = cn.merge_ip_info([ipapi, ipinfo])
+    check("合并顺序无关", bool(m2 and m2["is_datacenter"] and m2["risk_score"] == 20))
+    vpn = dict(ipapi, is_vpn=True, risk_score=95)
+    m3 = cn.merge_ip_info([ipinfo, vpn])
+    check("合并取 VPN/高分", bool(m3 and m3["is_vpn"] and m3["risk_score"] == 95))
+    check("空合并", cn.merge_ip_info([]) is None)
+
+
+def test_hosting_heuristic():
+    """ip-api hosting 漏判时，ASN/组织关键词启发式要能补上机房判定"""
+    s = cn.load_settings()
+    src = cn.IPAPISource(s)
+    check("ASN 命中机房", src._looks_like_hosting("AS209363 Skinark LTD", "", "", ""))
+    check("关键词命中机房", src._looks_like_hosting("Amazon.com, Inc.", "AWS", "", ""))
+    check("住宅不误判", not src._looks_like_hosting(
+        "AS28118 ALTICE DOMINICANA S.A.", "Altice", "Altice", ""))
+    check("Google Fiber 不误判", not src._looks_like_hosting(
+        "AS16591 Google Fiber Inc.", "Google Fiber", "Google Fiber", ""))
+    check("Cloud IP 命中", src._looks_like_hosting("AS396982 GOOGLE-CLOUD-PLATFORM", "", "", ""))
+    s2 = dict(s, hosting_asns=["AS65001"], hosting_keywords=["myhost"])
+    src2 = cn.IPAPISource(s2)
+    check("自定义 ASN", src2._looks_like_hosting("AS65001 X"))
+    check("自定义关键词", src2._looks_like_hosting("MyHost Ltd"))
+
+
+def test_cache_skips_none():
+    """检测失败的 None 不能持久化，否则一次限流会永久污染缓存"""
+    import tempfile
+    settings = cn.load_settings()
+    p = os.path.join(tempfile.mkdtemp(), "cache.json")
+    settings["ip_cache_file"] = p
+    chk = cn.IPChecker(settings)
+    chk.cache = {"1.1.1.1": None, "2.2.2.2": {"ip": "2.2.2.2"}}
+    chk.save_disk_cache()
+    with open(p, encoding="utf-8") as f:
+        data = json.load(f)
+    check("缓存不落盘 None", "1.1.1.1" not in data and "2.2.2.2" in data, str(data))
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump({"3.3.3.3": None, "4.4.4.4": {"ip": "4.4.4.4"}}, f)
+    chk2 = cn.IPChecker(settings)
+    check("缓存不加载 None", "3.3.3.3" not in chk2.cache and "4.4.4.4" in chk2.cache,
+          str(chk2.cache))
+
+
 def main():
     print("=" * 70)
     print("离线回归测试")
@@ -274,6 +348,10 @@ def main():
     test_label_idempotent()
     asyncio.run(test_risk_levels())
     asyncio.run(test_unknown_info_is_not_clean())
+    test_ipinfo_classification()
+    test_merge_prefers_datacenter()
+    test_hosting_heuristic()
+    test_cache_skips_none()
     test_probe_classification()
     test_purity_split()
     test_rebuild_sources()
