@@ -16,8 +16,9 @@ risk_threshold: 30
 
 # 是否把判定为高风险的节点从输出中剔除
 # true  = 剔除，明细写入 output/filtered_nodes.log
-# false = 全部保留并打标签，同时单独写入 output/risky_nodes.txt
-# 注意：只有 filter_risky=false 时才会生成 output/risky_nodes.txt
+# false = 全部保留并打标签，同时把风险保留的节点写入 output/risky_nodes.txt
+# 注意：只要存在未过滤的风险保留节点（例如 filter_vpn=false 时的 VPN 节点），
+# 就会生成 output/risky_nodes.txt；没有则自动删除该文件。
 filter_risky: true
 
 # 是否过滤被标记为 VPN 的 IP

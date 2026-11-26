@@ -4,6 +4,11 @@ output/ip_cache.json
 # 抓取中间产物，由 fetch 脚本自动维护（仅作为流水线工作文件，不入库）
 output/raw_nodes.txt
 
+# 清洗明细日志（本地诊断用，不入库）
+output/dead_nodes.log
+output/filtered_nodes.log
+output/risky_nodes.txt
+
 # Python
 __pycache__/
 *.py[cod]

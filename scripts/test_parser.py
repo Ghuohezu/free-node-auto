@@ -206,6 +206,59 @@ def test_rebuild_sources():
     return tmpdir
 
 
+def test_ss_query_port():
+    """ss(SIP002) 的 ?plugin=/? 查询串不能混进端口，否则会被误判不可达"""
+    cases = [
+        ("ss plugin", "ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8388?plugin=obfs-local%3Bobfs%3Dhttp#A", "8388"),
+        ("ss 空查询", "ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:19999?#B", "19999"),
+        ("ss 无查询", "ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8388#C", "8388"),
+    ]
+    for name, line, expect in cases:
+        n = cn.parse_node(line, PROTOCOLS)
+        check(name, bool(n and n.port == expect and n.port.isdigit()),
+              f"{n.host if n else None}:{n.port if n else None}")
+
+
+def test_ipv6_and_port_validation():
+    """IPv6 节点应可解析；缺少/非法端口的节点必须拒绝"""
+    v6 = cn.parse_node("vless://uuid@[2001:db8::1]:443?security=tls#v6", PROTOCOLS)
+    check("IPv6 解析", bool(v6 and v6.host == "2001:db8::1" and v6.port == "443"),
+          f"{v6.host if v6 else None}:{v6.port if v6 else None}")
+    check("缺端口拒绝", cn.parse_node("hysteria2://1.2.3.4#noport", PROTOCOLS) is None)
+    check("非法端口拒绝", cn.parse_node("trojan://pw@1.2.3.4:70000#bad", PROTOCOLS) is None)
+
+
+def test_label_idempotent():
+    """重复清洗已打标节点，不能把旧标签一路叠加"""
+    p = cn.NodeProcessor(cn.load_settings())
+    n = cn.parse_node("trojan://pw@1.2.3.4:443#name", PROTOCOLS)
+    first = p.apply_label(n, "【⚪ 住宅|原生】")
+    n2 = cn.parse_node(first, PROTOCOLS)
+    second = p.apply_label(n2, "【🟢 机房|原生】")
+    check("标签幂等", second.count("【") == 1 and "name" in second, second)
+
+
+async def test_unknown_info_is_not_clean():
+    """IP 已解析但检测结果为空时，必须归为 UNKNOWN 而不是 CLEAN"""
+    class NullChecker:
+        def save_disk_cache(self):
+            pass
+
+        async def check(self, session, ip):
+            return None
+
+    node = cn.parse_node("vless://uuid@1.2.3.4:443#UNK", PROTOCOLS)
+    settings = cn.load_settings()
+    p = cn.NodeProcessor(settings)
+    p.checker = NullChecker()
+    p.dns_cache["1.2.3.4"] = "1.2.3.4"
+    _, results, _ = await p.process([node])
+    rec = results[0]
+    check("未知不记 CLEAN", rec["risk_level"] == "UNKNOWN" and p.stats["clean"] == 0,
+          f"risk_level={rec['risk_level']} clean={p.stats['clean']}")
+    check("未知计入 unknown", p.stats["unknown"] == 1, f"unknown={p.stats['unknown']}")
+
+
 def main():
     print("=" * 70)
     print("离线回归测试")
@@ -216,7 +269,11 @@ def main():
     test_ssr()
     test_truncated_base64()
     test_host_validation()
+    test_ss_query_port()
+    test_ipv6_and_port_validation()
+    test_label_idempotent()
     asyncio.run(test_risk_levels())
+    asyncio.run(test_unknown_info_is_not_clean())
     test_probe_classification()
     test_purity_split()
     test_rebuild_sources()

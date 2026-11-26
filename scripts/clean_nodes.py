@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -7,6 +8,7 @@ import socket
 import ssl
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import unquote
 
 try:
     import yaml
@@ -24,6 +26,9 @@ except Exception:
 INPUT = "output/raw_nodes.txt"
 HOME_OUTPUT = "output/home_nodes.txt"
 DC_OUTPUT = "output/datacenter_nodes.txt"
+DEAD_LOG = "output/dead_nodes.log"
+FILTERED_LOG = "output/filtered_nodes.log"
+RISKY_OUTPUT = "output/risky_nodes.txt"
 SETTINGS_FILE = "config/settings.yaml"
 
 DEFAULT_SETTINGS = {
@@ -77,6 +82,16 @@ SHARED_TABLE = [
 IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 # 主机名：字母数字连字符分段，且总长度不超过 253
 HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)+$")
+# 本脚本写入的标签形如 【⚪ 住宅|原生】/【❓ 未知】，仅识别这一类，避免误删节点自带前缀
+LABEL_PREFIX_RE = re.compile(r"^(?:【[^】]*(?:\||未知)[^】]*】\s*)+")
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address((host or "").strip("[]"))
+        return True
+    except ValueError:
+        return False
 
 
 def purity_emoji(score) -> str:
@@ -200,9 +215,12 @@ def _split_remark(body: str) -> Tuple[str, str]:
 
 
 def _valid_host(host: str) -> bool:
+    host = (host or "").strip("[]").strip()
     if not host or len(host) > 253:
         return False
-    return bool(IPV4_RE.fullmatch(host) or HOSTNAME_RE.fullmatch(host))
+    if _is_ip_literal(host):
+        return True
+    return bool(HOSTNAME_RE.fullmatch(host))
 
 
 def _split_host_port(body: str) -> Tuple[str, str]:
@@ -246,21 +264,20 @@ def _parse_ssr(body: str) -> Tuple[str, str]:
 
 
 def _parse_ss(body: str) -> Tuple[str, str]:
-    if "@" in body and not body.startswith("ss://"):
-        rest = body.split("@", 1)[1]
-        host, _, port = rest.partition(":")
-        return host.strip("[]"), port
+    # SIP002 的插件参数以 ?plugin=... 形式跟在 host:port 后面，必须先剥离，
+    # 否则端口会变成 "8388?plugin=..."，后续 int(port) 失败导致节点被误判不可达。
+    body = body.split("?", 1)[0]
+    if "@" in body:
+        return _split_host_port(body)
     try:
         decoded = b64_text(body)
-        if "@" in decoded:
-            rest = decoded.split("@", 1)[1]
-            host, _, port = rest.partition(":")
-            return host.strip("[]"), port
-        pieces = decoded.split(":")
-        if len(pieces) >= 2:
-            return pieces[-2], pieces[-1]
     except Exception:
-        pass
+        return "", ""
+    if "@" in decoded:
+        return _split_host_port(decoded)
+    pieces = decoded.split(":")
+    if len(pieces) >= 2:
+        return pieces[-2].strip("[]"), pieces[-1].strip("[]")
     return "", ""
 
 
@@ -290,6 +307,8 @@ def parse_node(line: str, protocols: List[str]) -> Optional[Node]:
         host, port = _split_host_port(body)
 
     if not host or not _valid_host(host):
+        return None
+    if not port or not port.isdigit() or not (1 <= int(port) <= 65535):
         return None
     return Node(line, protocol, remark, host, port)
 
@@ -484,8 +503,8 @@ class NodeProcessor:
         self.results: List[Dict] = []
 
     async def resolve_ip(self, host: str, loop) -> Optional[str]:
-        if IPV4_RE.match(host):
-            return host
+        if _is_ip_literal(host):
+            return host.strip("[]")
         if host in self.dns_cache:
             return self.dns_cache[host]
         try:
@@ -520,7 +539,9 @@ class NodeProcessor:
     def apply_label(self, node: Node, label: str) -> str:
         raw = node.raw
         body, _remark = _split_remark(raw)
-        return f"{body}#{label} {node.remark}"
+        # 去掉上一次运行留下的标签，保证重复清洗时不会出现 【新】 【旧】 名称 的叠加
+        remark = LABEL_PREFIX_RE.sub("", node.remark or "").strip() or node.remark
+        return f"{body}#{label} {remark}"
 
     async def process_one(self, node: Node, session, loop) -> Tuple[Optional[str], Dict]:
         ip = await self.resolve_ip(node.host, loop)
@@ -579,6 +600,12 @@ class NodeProcessor:
             record["filter_reason"] = "IP 黑名单"
             return None, record
 
+        # IP 已解析但检测源全部失败：这属于"未知"，不能当作 CLEAN 正常节点
+        if info is None:
+            self.stats["unknown"] += 1
+            record["risk_level"] = "UNKNOWN"
+            return self.apply_label(node, label), record
+
         risk_level = "CLEAN"
         if is_vpn:
             risk_level = "RISKY"
@@ -608,6 +635,7 @@ class NodeProcessor:
             timeout=aiohttp.ClientTimeout(total=self.settings["request_timeout"]),
             connector=connector,
             headers=headers,
+            trust_env=True,
         ) as session:
             async def worker(node: Node):
                 async with sem:
@@ -617,7 +645,7 @@ class NodeProcessor:
                 if idx % 25 == 0 or idx == len(nodes):
                     print(f"  处理中: {idx}/{len(nodes)}", end="\r", flush=True)
 
-                if IPV4_RE.match(node.host):
+                if _is_ip_literal(node.host):
                     self.stats["ip_only"] += 1
                 else:
                     self.stats["domain_only"] += 1
@@ -654,7 +682,7 @@ class NodeProcessor:
                         f"[风险保留] {record['remark']} | IP: {record['ip']} | "
                         f"分数: {record['fraud_score']} | {record['filter_reason'] or '风险标记'}"
                     )
-                else:
+                elif record["risk_level"] == "CLEAN":
                     self.stats["clean"] += 1
 
                 # 订阅输出必须保留每一个不同的节点串（同一服务器常有多个 uuid/协议），
@@ -863,12 +891,13 @@ async def main():
         print("⚠️ 未找到任何节点，请检查输入文件")
         return
 
+    input_total = len(nodes)
+    dead: List[Tuple[Node, str]] = []
     dead_hostport: set = set()
     if settings.get("probe_reachability"):
         print("🛰 正在探测节点可达性...", flush=True)
         prober = ReachabilityProber(settings)
         alive: List[Node] = []
-        dead: List[Tuple[Node, str]] = []
 
         async def _probe_one(node: Node) -> None:
             ok, note = await prober.probe(node)
@@ -880,17 +909,24 @@ async def main():
         await asyncio.gather(*[_probe_one(n) for n in nodes])
         nodes = alive
         dead_hostport = {(node.host.lower(), str(node.port)) for node, _ in dead}
-        print(f"  🚫 不可达节点: {len(dead)}", flush=True)
+        print(
+            f"  🚫 不可达节点: {len(dead)}"
+            f"（去重 host:port {len(dead_hostport)}）",
+            flush=True,
+        )
 
     processor = NodeProcessor(settings)
-    processor.stats["dead"] = len(dead_hostport)
-    final_nodes, results, _risky_nodes = await processor.process(nodes)
+    processor.stats["input_total"] = input_total
+    processor.stats["dead"] = len(dead)
+    processor.stats["dead_unique"] = len(dead_hostport)
+    final_nodes, results, risky_nodes = await processor.process(nodes)
 
     print("\n" + "=" * 70)
     print("📊 处理统计:")
     print("=" * 70)
-    print(f"✅ 总节点数:   {processor.stats['total']}")
-    print(f"🛰  不可达:     {processor.stats.get('dead', 0)}")
+    print(f"📥 输入节点数: {processor.stats['input_total']}")
+    print(f"🛰  不可达:     {processor.stats['dead']} (去重 host:port {processor.stats['dead_unique']})")
+    print(f"🧼 参与清洗:   {processor.stats['total']}")
     print(f"🌐 IP 直连:     {processor.stats['ip_only']}")
     print(f"📍 域名解析:    {processor.stats['domain_only']}")
     print(f"✓ 正常节点:     {processor.stats['clean']}")
@@ -900,6 +936,23 @@ async def main():
     print(f"🔄 去重后输出:  {len(final_nodes)}")
 
     os.makedirs("output", exist_ok=True)
+
+    # 落盘明细日志，和 config/settings.yaml 中的说明保持一致
+    with open(DEAD_LOG, "w", encoding="utf-8") as f:
+        for node, note in dead:
+            f.write(f"[{note}] {node.raw}\n")
+    with open(FILTERED_LOG, "w", encoding="utf-8") as f:
+        for line in processor.filtered_log:
+            f.write(line + "\n")
+    if risky_nodes:
+        with open(RISKY_OUTPUT, "w", encoding="utf-8") as f:
+            for node in risky_nodes:
+                f.write(node + "\n")
+    else:
+        try:
+            os.remove(RISKY_OUTPUT)
+        except OSError:
+            pass
 
     # 切分纯净度 <= purity_split 的家宽/机房节点
     split = settings["purity_split"]
